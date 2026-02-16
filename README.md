@@ -209,16 +209,18 @@ How long data can be stored. What happens when it expires.
 
 ---
 
-## PCI DSS v4.0 Requirement 3 Coverage
+## PCI DSS v4.0 Requirement 3 — Storage Governance
+
+Vault covers the **storage governance** portions of Req 3. Encryption and key management are out of scope — those are the responsibility of the upstream encryption service (e.g., a CryptAply plugin, Azure Key Vault, your own crypto stack).
 
 | PCI Req | Requirement | Vault Control |
 |---------|-------------|---------------|
 | **3.1.1** | Data retention policies | Retention policies per purpose with max_retention_days and enforced TTL |
 | **3.1.2** | Data limited to what is needed | Purpose-scoped storage with expiry. Purge sweep enforces removal. |
-| **3.3.2** | PAN rendered unreadable | Vault stores already-encrypted values. Never sees plaintext. |
-| **3.5.1** | Access to crypto keys restricted | Vault doesn't hold keys. Keys are in Azure KV / HC Vault / AWS KMS. |
-| **3.6.1.4** | Key changes at cryptoperiod end | Tracks `key_ref` per entry. Reports entries on stale keys. |
-| **3.7.1** | Key management policies documented | `/compliance/report` generates policy, key states, purge compliance. |
+| **3.3.2** | PAN rendered unreadable | Vault stores already-encrypted values. Never sees plaintext. Opacity guaranteed. |
+| **3.5.1.2** | Restrict access to stored data | Per-entry access policies. Every retrieve logged with grant/deny and caller identity. |
+
+**Not in scope for vsql-vault:** Key management (3.5.1, 3.6, 3.7), encryption algorithms, key rotation, key lifecycle. Those controls belong to the upstream encryption service.
 
 ---
 
@@ -238,22 +240,22 @@ How long data can be stored. What happens when it expires.
     "card": {
       "active": 8200,
       "retention_policy": "365 days max, 90 day default TTL",
-      "entries_expiring_next_30_days": 320,
-      "key_refs": {
-        "akv:payez-kv:card-key-v7": 7800,
-        "akv:payez-kv:card-key-v6": 400
-      }
+      "entries_expiring_next_30_days": 320
     }
   },
   "purge_compliance": {
     "purge_sweep_last_run": "2026-02-16T04:00:00Z",
     "entries_purged_last_sweep": 12,
     "purge_proof_available": true
+  },
+  "access_summary": {
+    "total_accesses_last_30_days": 45000,
+    "denied_accesses_last_30_days": 23
   }
 }
 ```
 
-Hand this to your QSA. Requirement 3 evidence, generated automatically.
+Storage governance evidence for your QSA — retention compliance, purge proof, access audit.
 
 ---
 
@@ -295,14 +297,14 @@ vault.purge_log          — Proof of deletion (SHA-256 hash, method, reason)
 
 ---
 
-## The VibeSQL Compliance Stack
+## The VibeSQL Product Family
 
 ```
 ┌────────────┐  ┌────────────┐  ┌──────────┐  ┌──────────────┐
 │ VibeSQL    │  │ VibeSQL    │  │ VibeSQL  │  │ VibeSQL      │
 │ Micro      │  │ Vault      │  │ Audit    │  │ Edge         │
-│ (database) │  │ (Req 3)    │  │ (Req 10) │  │ (auth)       │
-│ 77MB       │  │ ~10MB      │  │          │  │              │
+│ (database) │  │ (governed  │  │ (Req 10) │  │ (auth)       │
+│ 77MB       │  │  storage)  │  │          │  │              │
 └────────────┘  └────────────┘  └──────────┘  └──────────────┘
      │               │               │              │
      └───── Micro + Vault = minimal CDE ────────────┘
