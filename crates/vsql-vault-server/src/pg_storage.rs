@@ -30,8 +30,8 @@ impl VaultStorage for PgStorage {
         sqlx::query(
             r#"
             INSERT INTO vsql_vault.vault_entries
-                (id, purpose, encrypted_blob, owner_app, encryption_svc, content_type, tags, created_at, updated_at, expires_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                (id, purpose, encrypted_blob, owner_app, encryption_svc, content_type, tags, created_at, updated_at, expires_at, access_policy)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             ON CONFLICT (purpose, id) DO UPDATE SET
                 encrypted_blob = EXCLUDED.encrypted_blob,
                 owner_app = EXCLUDED.owner_app,
@@ -39,7 +39,8 @@ impl VaultStorage for PgStorage {
                 content_type = EXCLUDED.content_type,
                 tags = EXCLUDED.tags,
                 updated_at = EXCLUDED.updated_at,
-                expires_at = EXCLUDED.expires_at
+                expires_at = EXCLUDED.expires_at,
+                access_policy = EXCLUDED.access_policy
             "#,
         )
         .bind(entry.id)
@@ -52,6 +53,7 @@ impl VaultStorage for PgStorage {
         .bind(entry.created_at)
         .bind(entry.updated_at)
         .bind(entry.expires_at)
+        .bind(&entry.access_policy)
         .execute(&self.pool)
         .await
         .map_err(|e| VaultError::Storage(e.to_string()))?;
@@ -62,7 +64,8 @@ impl VaultStorage for PgStorage {
     async fn retrieve(&self, purpose: &str, id: &Uuid) -> Result<Option<VaultEntry>, VaultError> {
         let row = sqlx::query_as::<_, EntryRow>(
             r#"
-            SELECT id, purpose, encrypted_blob, owner_app, encryption_svc, content_type, tags, created_at, updated_at, expires_at
+            SELECT id, purpose, encrypted_blob, owner_app, encryption_svc, content_type, tags,
+                   created_at, updated_at, expires_at, access_policy
             FROM vsql_vault.vault_entries
             WHERE purpose = $1 AND id = $2
               AND (expires_at IS NULL OR expires_at > NOW())
@@ -130,14 +133,56 @@ impl VaultStorage for PgStorage {
     }
 
     async fn purge_expired(&self) -> Result<u64, VaultError> {
-        let result = sqlx::query(
-            "DELETE FROM vsql_vault.vault_entries WHERE expires_at IS NOT NULL AND expires_at <= NOW()",
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| VaultError::Storage(e.to_string()))?;
+
+        // Delete expired entries and return them for proof generation
+        let deleted_rows = sqlx::query_as::<_, EntryRow>(
+            r#"
+            DELETE FROM vsql_vault.vault_entries
+            WHERE expires_at IS NOT NULL AND expires_at <= NOW()
+            RETURNING id, purpose, encrypted_blob, owner_app, encryption_svc, content_type,
+                      tags, created_at, updated_at, expires_at, access_policy
+            "#,
         )
-        .execute(&self.pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|e| VaultError::Storage(e.to_string()))?;
 
-        Ok(result.rows_affected())
+        let count = deleted_rows.len() as u64;
+
+        // Record purge proof for each deleted entry
+        for row in deleted_rows {
+            let entry = VaultEntry::from(row);
+            let proof_hash = vsql_vault_core::purge::compute_proof_hash(&entry);
+
+            sqlx::query(
+                r#"
+                INSERT INTO vsql_vault.purge_log
+                    (entry_id, purpose, external_id, purge_method, purge_reason, purged_at, purged_by, proof_hash)
+                VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7)
+                "#,
+            )
+            .bind(entry.id)
+            .bind(&entry.purpose)
+            .bind(entry.id.to_string())
+            .bind("retention-expire")
+            .bind("ttl-expired")
+            .bind("system/purge-scheduler")
+            .bind(proof_hash)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| VaultError::Storage(format!("failed to record purge proof: {e}")))?;
+        }
+
+        tx.commit()
+            .await
+            .map_err(|e| VaultError::Storage(e.to_string()))?;
+
+        Ok(count)
     }
 
     async fn health_check(&self) -> Result<(), VaultError> {
@@ -397,6 +442,7 @@ struct EntryRow {
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
     expires_at: Option<chrono::DateTime<Utc>>,
+    access_policy: String,
 }
 
 impl From<EntryRow> for VaultEntry {
@@ -415,6 +461,7 @@ impl From<EntryRow> for VaultEntry {
             created_at: row.created_at,
             updated_at: row.updated_at,
             expires_at: row.expires_at,
+            access_policy: row.access_policy,
         }
     }
 }

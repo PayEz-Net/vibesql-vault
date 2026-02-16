@@ -88,6 +88,7 @@ mod tests {
                 .with_timezone(&Utc),
             updated_at: Utc::now(),
             expires_at: None,
+            access_policy: "owner-only".into(),
         }
     }
 

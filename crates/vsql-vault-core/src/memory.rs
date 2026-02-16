@@ -108,9 +108,38 @@ impl VaultStorage for MemoryStorage {
     async fn purge_expired(&self) -> Result<u64, VaultError> {
         let now = Utc::now();
         let mut entries = self.entries.write().await;
-        let before = entries.len();
+
+        // Collect expired entries for proof generation before removal
+        let expired: Vec<crate::entry::VaultEntry> = entries
+            .values()
+            .filter(|e| e.expires_at.is_some_and(|exp| now > exp))
+            .cloned()
+            .collect();
+
+        let count = expired.len() as u64;
+
+        // Generate proof hash and record purge log for each expired entry
+        if !expired.is_empty() {
+            let mut purge_log = self.purge_log.write().await;
+            for entry in &expired {
+                let proof_hash = crate::purge::compute_proof_hash(entry);
+                purge_log.push(PurgeLogEntry {
+                    id: None,
+                    entry_id: entry.id,
+                    purpose: entry.purpose.clone(),
+                    external_id: entry.id.to_string(),
+                    purge_method: crate::purge::PurgeMethod::RetentionExpire,
+                    purge_reason: "ttl-expired".into(),
+                    purged_at: now,
+                    purged_by: "system/purge-scheduler".into(),
+                    proof_hash: Some(proof_hash),
+                });
+            }
+        }
+
+        // Remove expired entries
         entries.retain(|_, e| e.expires_at.is_none_or(|exp| now <= exp));
-        Ok((before - entries.len()) as u64)
+        Ok(count)
     }
 
     async fn health_check(&self) -> Result<(), VaultError> {
@@ -211,6 +240,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             expires_at,
+            access_policy: "owner-only".into(),
         }
     }
 

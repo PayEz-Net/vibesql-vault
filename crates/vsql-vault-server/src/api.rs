@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use vsql_vault_core::access_log::{AccessLogEntry, Operation};
 use vsql_vault_core::access_policy::AccessPolicy;
+use vsql_vault_core::auth::AuthContext;
 use vsql_vault_core::entry::{VaultEntry, VaultMetadata};
 use vsql_vault_core::error::{ErrorResponse, VaultError};
 use vsql_vault_core::purge::{self, PurgeLogEntry, PurgeMethod};
@@ -83,9 +84,10 @@ fn default_limit() -> u32 {
 pub async fn store_entry(
     State(state): State<Arc<AppState>>,
     Path((purpose, entry_id)): Path<(String, Uuid)>,
+    Extension(auth): Extension<AuthContext>,
     Json(body): Json<StoreRequest>,
 ) -> impl IntoResponse {
-    let caller_app = body.metadata.owner_app.clone();
+    let caller_app = &auth.caller_id;
     let policy_name = body
         .access_policy
         .as_deref()
@@ -96,17 +98,20 @@ pub async fn store_entry(
     let blob = match base64::prelude::BASE64_STANDARD.decode(&body.encrypted_blob) {
         Ok(b) => b,
         Err(e) => {
-            log_and_forget(
+            if let Err(resp) = audit_log(
                 &state,
                 AccessLogEntry::denied(
                     Some(entry_id),
                     &purpose,
                     Operation::Store,
-                    &caller_app,
+                    caller_app,
                     &format!("invalid base64: {e}"),
                 ),
             )
-            .await;
+            .await
+            {
+                return resp;
+            }
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
@@ -120,17 +125,20 @@ pub async fn store_entry(
 
     // Size check
     if blob.len() > state.max_body_bytes {
-        log_and_forget(
+        if let Err(resp) = audit_log(
             &state,
             AccessLogEntry::denied(
                 Some(entry_id),
                 &purpose,
                 Operation::Store,
-                &caller_app,
+                caller_app,
                 "payload too large",
             ),
         )
-        .await;
+        .await
+        {
+            return resp;
+        }
         return vault_error_response(&VaultError::PayloadTooLarge {
             size: blob.len(),
             limit: state.max_body_bytes,
@@ -145,23 +153,26 @@ pub async fn store_entry(
         .ok()
         .flatten()
     {
-        let decision = policy.can_store(&caller_app);
+        let decision = policy.can_store(caller_app);
         if !decision.is_allowed() {
             let reason = match decision {
                 vsql_vault_core::access_policy::PolicyDecision::Deny(r) => r,
                 _ => "denied".into(),
             };
-            log_and_forget(
+            if let Err(resp) = audit_log(
                 &state,
                 AccessLogEntry::denied(
                     Some(entry_id),
                     &purpose,
                     Operation::Store,
-                    &caller_app,
+                    caller_app,
                     &reason,
                 ),
             )
-            .await;
+            .await
+            {
+                return resp;
+            }
             return vault_error_response(&VaultError::Forbidden(reason));
         }
     }
@@ -174,17 +185,20 @@ pub async fn store_entry(
                 effective_expires_at = expires_at;
             }
             RetentionDecision::Reject { reason } => {
-                log_and_forget(
+                if let Err(resp) = audit_log(
                     &state,
                     AccessLogEntry::denied(
                         Some(entry_id),
                         &purpose,
                         Operation::Store,
-                        &caller_app,
+                        caller_app,
                         &reason,
                     ),
                 )
-                .await;
+                .await
+                {
+                    return resp;
+                }
                 return (
                     StatusCode::UNPROCESSABLE_ENTITY,
                     Json(serde_json::json!({
@@ -211,16 +225,20 @@ pub async fn store_entry(
         created_at: now,
         updated_at: now,
         expires_at: effective_expires_at,
+        access_policy: policy_name.clone(),
     };
 
     match state.storage.store(&entry).await {
         Ok(()) => {
-            // Audit log: granted store
-            log_and_forget(
+            // Blocking audit log: granted store
+            if let Err(resp) = audit_log(
                 &state,
-                AccessLogEntry::granted(Some(entry_id), &purpose, Operation::Store, &caller_app),
+                AccessLogEntry::granted(Some(entry_id), &purpose, Operation::Store, caller_app),
             )
-            .await;
+            .await
+            {
+                return resp;
+            }
 
             (
                 StatusCode::CREATED,
@@ -229,7 +247,7 @@ pub async fn store_entry(
                     purpose,
                     created_at: now,
                     expires_at: effective_expires_at,
-                    access_policy: policy_name.to_string(),
+                    access_policy: policy_name,
                 })),
             )
                 .into_response()
@@ -241,15 +259,14 @@ pub async fn store_entry(
 pub async fn retrieve_entry(
     State(state): State<Arc<AppState>>,
     Path((purpose, entry_id)): Path<(String, Uuid)>,
+    Extension(auth): Extension<AuthContext>,
 ) -> impl IntoResponse {
-    // For now, caller_app comes from the fact they have the API key.
-    // In production, this would come from JWT claims or mTLS cert.
-    let caller_app = "authenticated-caller";
+    let caller_app = &auth.caller_id;
 
     match state.storage.retrieve(&purpose, &entry_id).await {
         Ok(Some(entry)) => {
-            // Check access policy
-            let policy_name = "owner-only"; // TODO: store access_policy on entry and check here
+            // Check access policy — use the policy stored on the entry
+            let policy_name = &entry.access_policy;
             if let Ok(Some(policy)) = state.storage.get_access_policy(policy_name).await {
                 let decision = policy.can_retrieve(caller_app, &entry.metadata.owner_app);
                 if !decision.is_allowed() {
@@ -257,7 +274,7 @@ pub async fn retrieve_entry(
                         vsql_vault_core::access_policy::PolicyDecision::Deny(r) => r,
                         _ => "denied".into(),
                     };
-                    log_and_forget(
+                    if let Err(resp) = audit_log(
                         &state,
                         AccessLogEntry::denied(
                             Some(entry_id),
@@ -267,22 +284,28 @@ pub async fn retrieve_entry(
                             &reason,
                         ),
                     )
-                    .await;
+                    .await
+                    {
+                        return resp;
+                    }
                     return vault_error_response(&VaultError::Forbidden(reason));
                 }
             }
 
-            // Audit log: granted retrieve
-            log_and_forget(
+            // Blocking audit log: granted retrieve
+            if let Err(resp) = audit_log(
                 &state,
                 AccessLogEntry::granted(Some(entry_id), &purpose, Operation::Retrieve, caller_app),
             )
-            .await;
+            .await
+            {
+                return resp;
+            }
 
             (StatusCode::OK, Json(serde_json::to_value(entry).unwrap())).into_response()
         }
         Ok(None) => {
-            log_and_forget(
+            if let Err(resp) = audit_log(
                 &state,
                 AccessLogEntry::denied(
                     Some(entry_id),
@@ -292,7 +315,10 @@ pub async fn retrieve_entry(
                     "not found",
                 ),
             )
-            .await;
+            .await
+            {
+                return resp;
+            }
             vault_error_response(&VaultError::NotFound {
                 purpose,
                 id: entry_id.to_string(),
@@ -305,8 +331,9 @@ pub async fn retrieve_entry(
 pub async fn delete_entry(
     State(state): State<Arc<AppState>>,
     Path((purpose, entry_id)): Path<(String, Uuid)>,
+    Extension(auth): Extension<AuthContext>,
 ) -> impl IntoResponse {
-    let caller_app = "authenticated-caller";
+    let caller_app = &auth.caller_id;
 
     // Retrieve entry first for purge proof
     let entry_for_proof = state
@@ -329,7 +356,7 @@ pub async fn delete_entry(
                     purge_method: PurgeMethod::PhysicalDelete,
                     purge_reason: "manual".into(),
                     purged_at: Utc::now(),
-                    purged_by: caller_app.into(),
+                    purged_by: caller_app.clone(),
                     proof_hash: Some(proof_hash),
                 };
                 if let Err(e) = state.storage.record_purge(&purge_entry).await {
@@ -337,17 +364,20 @@ pub async fn delete_entry(
                 }
             }
 
-            // Audit log
-            log_and_forget(
+            // Blocking audit log
+            if let Err(resp) = audit_log(
                 &state,
                 AccessLogEntry::granted(Some(entry_id), &purpose, Operation::Delete, caller_app),
             )
-            .await;
+            .await
+            {
+                return resp;
+            }
 
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(false) => {
-            log_and_forget(
+            if let Err(resp) = audit_log(
                 &state,
                 AccessLogEntry::denied(
                     Some(entry_id),
@@ -357,7 +387,10 @@ pub async fn delete_entry(
                     "not found",
                 ),
             )
-            .await;
+            .await
+            {
+                return resp;
+            }
             vault_error_response(&VaultError::NotFound {
                 purpose,
                 id: entry_id.to_string(),
@@ -370,16 +403,20 @@ pub async fn delete_entry(
 pub async fn head_entry(
     State(state): State<Arc<AppState>>,
     Path((purpose, entry_id)): Path<(String, Uuid)>,
+    Extension(auth): Extension<AuthContext>,
 ) -> impl IntoResponse {
-    let caller_app = "authenticated-caller";
+    let caller_app = &auth.caller_id;
 
     match state.storage.retrieve(&purpose, &entry_id).await {
         Ok(Some(entry)) => {
-            log_and_forget(
+            if let Err(resp) = audit_log(
                 &state,
                 AccessLogEntry::granted(Some(entry_id), &purpose, Operation::Head, caller_app),
             )
-            .await;
+            .await
+            {
+                return resp;
+            }
 
             let mut headers = axum::http::HeaderMap::new();
             headers.insert(
@@ -404,9 +441,10 @@ pub async fn head_entry(
 pub async fn list_entries(
     State(state): State<Arc<AppState>>,
     Path(purpose): Path<String>,
+    Extension(auth): Extension<AuthContext>,
     Query(params): Query<ListParams>,
 ) -> impl IntoResponse {
-    let caller_app = "authenticated-caller";
+    let caller_app = &auth.caller_id;
 
     match state
         .storage
@@ -414,11 +452,14 @@ pub async fn list_entries(
         .await
     {
         Ok((summaries, total)) => {
-            log_and_forget(
+            if let Err(resp) = audit_log(
                 &state,
                 AccessLogEntry::granted(None, &purpose, Operation::List, caller_app),
             )
-            .await;
+            .await
+            {
+                return resp;
+            }
 
             let entries: Vec<ListEntry> = summaries
                 .into_iter()
@@ -516,16 +557,26 @@ fn vault_error_response(err: &VaultError) -> axum::response::Response {
     (status, Json(body)).into_response()
 }
 
-/// Fire-and-forget audit log. If logging fails, log the error but don't fail the request.
-/// NOTE: In a hardened production build, this would be a blocking audit (fail the operation
-/// if audit logging fails). For now we degrade gracefully.
-async fn log_and_forget(state: &AppState, entry: AccessLogEntry) {
-    if let Err(e) = state.storage.log_access(&entry).await {
+/// Blocking audit log. If audit logging fails, the operation is blocked for PCI compliance.
+/// Returns Err(Response) with 503 if the audit subsystem is unavailable.
+async fn audit_log(
+    state: &AppState,
+    entry: AccessLogEntry,
+) -> Result<(), axum::response::Response> {
+    state.storage.log_access(&entry).await.map_err(|e| {
         tracing::error!(
             error = %e,
             operation = %entry.operation,
             purpose = %entry.purpose,
-            "AUDIT LOG FAILURE - operation proceeded without audit record"
+            "AUDIT LOG FAILURE — operation blocked for PCI compliance"
         );
-    }
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "audit subsystem unavailable — operation blocked for compliance",
+                "code": 503
+            })),
+        )
+            .into_response()
+    })
 }

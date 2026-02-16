@@ -6,9 +6,10 @@ use axum::{
     Json,
 };
 use constant_time_eq::constant_time_eq;
+use vsql_vault_core::auth::AuthContext;
 use vsql_vault_core::error::ErrorResponse;
 
-pub async fn auth_middleware(request: Request, next: Next) -> Response {
+pub async fn auth_middleware(mut request: Request, next: Next) -> Response {
     let expected_key = match request.extensions().get::<ApiKey>() {
         Some(key) => key.0.clone(),
         None => {
@@ -31,6 +32,19 @@ pub async fn auth_middleware(request: Request, next: Next) -> Response {
 
     match provided {
         Some(token) if constant_time_eq(token.as_bytes(), expected_key.as_bytes()) => {
+            // Extract caller identity from X-Vault-Caller header
+            let caller_id = request
+                .headers()
+                .get("x-vault-caller")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("api-key-holder")
+                .to_string();
+
+            request.extensions_mut().insert(AuthContext {
+                caller_id,
+                allowed_purposes: None,
+            });
+
             next.run(request).await
         }
         _ => (

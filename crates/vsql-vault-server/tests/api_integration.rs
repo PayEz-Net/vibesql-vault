@@ -554,3 +554,136 @@ async fn test_admin_purge_log() {
     assert_eq!(entries[0]["purge_method"], "physical-delete");
     assert_eq!(entries[0]["purge_reason"], "manual");
 }
+
+#[tokio::test]
+async fn test_caller_identity_from_header() {
+    let (app, _) = build_app("test-key");
+    let id = Uuid::new_v4();
+
+    // Store with X-Vault-Caller header
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/v1/vault/card/{id}"))
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer test-key")
+                .header("x-vault-caller", "payment-api")
+                .body(Body::from(store_body("payez")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Retrieve without X-Vault-Caller — defaults to "api-key-holder"
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/vault/card/{id}"))
+                .header("authorization", "Bearer test-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_stored_access_policy_returned() {
+    let (app, _) = build_app("test-key");
+    let id = Uuid::new_v4();
+
+    // Store with explicit access_policy
+    let body = json!({
+        "encrypted_blob": "AQID",
+        "metadata": {
+            "owner_app": "payez",
+            "encryption_service": "azure-kv",
+            "content_type": "pan",
+            "tags": {}
+        },
+        "access_policy": "same-purpose"
+    })
+    .to_string();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/v1/vault/card/{id}"))
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer test-key")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let body = axum::body::to_bytes(resp.into_body(), 1_048_576)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["access_policy"], "same-purpose");
+
+    // Retrieve — response should include the stored access_policy
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/vault/card/{id}"))
+                .header("authorization", "Bearer test-key")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(resp.into_body(), 1_048_576)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["access_policy"], "same-purpose");
+}
+
+#[tokio::test]
+async fn test_purge_expired_generates_proof() {
+    let (_, state) = build_app("test-key");
+
+    // Store an entry that's already expired
+    let entry = vsql_vault_core::entry::VaultEntry {
+        id: Uuid::new_v4(),
+        purpose: "card".into(),
+        encrypted_blob: vec![1, 2, 3],
+        metadata: vsql_vault_core::entry::VaultMetadata {
+            owner_app: "test".into(),
+            encryption_service: None,
+            content_type: None,
+            tags: std::collections::HashMap::new(),
+        },
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        expires_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+        access_policy: "owner-only".into(),
+    };
+    state.storage.store(&entry).await.unwrap();
+
+    // Run purge
+    let purged = state.storage.purge_expired().await.unwrap();
+    assert_eq!(purged, 1);
+
+    // Check purge log has proof hash
+    let logs = state
+        .storage
+        .list_purge_log(Some("card"), 10, 0)
+        .await
+        .unwrap();
+    assert_eq!(logs.len(), 1);
+    assert!(logs[0].proof_hash.as_ref().unwrap().starts_with("sha256:"));
+    assert_eq!(logs[0].purge_reason, "ttl-expired");
+    assert_eq!(logs[0].purge_method.to_string(), "retention-expire");
+}

@@ -14,6 +14,12 @@ pub struct VaultEntry {
     pub updated_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
+    #[serde(default = "default_access_policy")]
+    pub access_policy: String,
+}
+
+fn default_access_policy() -> String {
+    "owner-only".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +104,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             expires_at: None,
+            access_policy: "owner-only".into(),
         };
         assert!(!entry.is_expired());
     }
@@ -117,6 +124,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             expires_at: Some(Utc::now() - chrono::Duration::hours(1)),
+            access_policy: "owner-only".into(),
         };
         assert!(entry.is_expired());
     }
@@ -136,6 +144,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+            access_policy: "owner-only".into(),
         };
         assert!(!entry.is_expired());
     }
@@ -155,6 +164,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             expires_at: None,
+            access_policy: "owner-only".into(),
         };
         let summary = VaultEntrySummary::from(entry.clone());
         assert_eq!(summary.id, entry.id);
@@ -176,6 +186,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             expires_at: None,
+            access_policy: "owner-only".into(),
         };
         let json = serde_json::to_string(&entry).unwrap();
         let decoded: VaultEntry = serde_json::from_str(&json).unwrap();
