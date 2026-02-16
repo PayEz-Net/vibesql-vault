@@ -1,0 +1,20 @@
+[server]
+listen_addr = "127.0.0.1:8420"
+request_timeout_secs = 30
+max_body_bytes = 1048576    # 1MB
+
+[database]
+url = "postgresql://vsql_vault@localhost:5432/vsql_vault"
+max_connections = 20
+min_connections = 2
+
+[auth]
+api_key_env = "VSQL_VAULT_API_KEY"
+
+[purge]
+enabled = true
+interval_secs = 3600
+
+[logging]
+level = "info"
+format = "json"

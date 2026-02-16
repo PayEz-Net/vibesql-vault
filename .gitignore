@@ -1,0 +1,6 @@
+/target
+**/target
+*.swp
+*.swo
+.env
+vsql-vault.toml
