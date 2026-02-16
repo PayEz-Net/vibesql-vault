@@ -1,10 +1,12 @@
 # VibeSQL Vault
 
-**Field-level encryption for VibeSQL. Drop it next to Micro. Shrink your PCI scope.**
+**Governed storage for encrypted data. Drop it next to Micro. Shrink your PCI scope.**
 
-VibeSQL Vault encrypts sensitive fields inside JSONB documents — card numbers, PII, secrets — before they reach PostgreSQL. Paired with [VibeSQL Micro](https://github.com/PayEz-Net/vibesql-micro), it becomes the smallest possible PCI cardholder data environment: one 77MB database binary, one ~10MB encryption proxy. Two processes, complete field-level protection, governed key lifecycle. That's your entire CDE.
+VibeSQL Vault is a hardened storage service for encrypted data. It doesn't encrypt. It doesn't decrypt. It stores opaque blobs that were encrypted somewhere else — Azure Key Vault, your own crypto stack, doesn't matter — and governs access to them.
 
-No TDE. No full-disk encryption where every authenticated query sees cleartext. Vault encrypts individual fields inside your JSONB documents. Non-sensitive data stays queryable. Sensitive data is opaque ciphertext that only Vault can decrypt.
+Think safety deposit box, not locksmith.
+
+Paired with [VibeSQL Micro](https://github.com/PayEz-Net/vibesql-micro), it becomes the smallest possible PCI cardholder data environment: one 77MB database binary, one ~10MB vault API. Two processes, governed storage, complete audit trail. That's your entire CDE.
 
 ---
 
@@ -17,15 +19,24 @@ Traditional PCI CDE:
   = months of scoping, dozens of components in scope
 
 VibeSQL CDE:
-  ┌──────────────────┐     ┌──────────────────┐
-  │ VibeSQL Micro    │     │ VibeSQL Vault    │
-  │ (database, 77MB) │◄────│ (encryption,~10MB)│
-  │ :5432            │     │ :5433            │
-  └──────────────────┘     └──────────────────┘
-  = two binaries, one machine, minimal attack surface
+  ┌─────────────────────────────────────┐
+  │  vsql-vault pod                      │
+  │                                      │
+  │  ┌───────────────┐                  │
+  │  │ vsql-vault    │  Rust binary,    │
+  │  │ API           │  FROM scratch,   │
+  │  │ (port 8443)   │  ~10MB           │
+  │  └───────┬───────┘                  │
+  │          │                           │
+  │  ┌───────┴───────┐                  │
+  │  │ VibeSQL Micro │  77MB binary,    │
+  │  │ (port 5432)   │  pod-internal    │
+  │  └───────────────┘                  │
+  └─────────────────────────────────────┘
+  = two binaries, one pod, minimal attack surface
 ```
 
-Your application connects to Vault on port 5433 instead of Micro on 5432. That's the only change. Vault intercepts the PostgreSQL wire protocol, encrypts sensitive JSONB fields on write, decrypts on read, and forwards everything else untouched.
+Micro's port is **not exposed** outside the pod. Only the vault API talks to it.
 
 **Why this matters for compliance:** PCI DSS scopes every system that stores, processes, or transmits cardholder data. Fewer systems in scope = less audit surface = faster certification. Micro + Vault is the minimum viable CDE.
 
@@ -34,55 +45,31 @@ Your application connects to Vault on port 5433 instead of Micro on 5432. That's
 ## How It Works
 
 ```
-Your Application (any language)
-  │
-  │  PostgreSQL wire protocol (port 5433)
-  ▼
-┌──────────────────────────────────────────┐
-│ VibeSQL Vault (Rust binary, port 5433)    │
-│                                           │
-│  Write path:                              │
-│    Parse query → match sensitive_fields   │
-│    → encrypt tagged JSONB fields          │
-│    → forward to VibeSQL (Micro or Server) │
-│                                           │
-│  Read path:                               │
-│    Receive result from VibeSQL            │
-│    → detect vault:v1:... envelopes        │
-│    → decrypt with current or grace key    │
-│    → return cleartext to application      │
-└──────────────────┬───────────────────────┘
-                   │  upstream, port 5432
-                   ▼
-            ┌──────────────┐
-            │ VibeSQL      │
-            │ Micro/Server │
-            └──────────────┘
+Store:
+  Your Encryption Stack              vsql-vault
+  (Azure KV, PayEz Encryption,      (governed storage)
+   any crypto you trust)
+
+    plaintext → encrypt → blob  ──►  PUT /vault/{purpose}/{id}
+                                      + metadata, ownership,
+                                      retention policy, access
+                                      contract
+
+Retrieve:
+                                      GET /vault/{purpose}/{id}  ──►  blob → decrypt → plaintext
+                                      (only if caller is             (your crypto stack
+                                       authorized per contract)       handles decryption)
 ```
 
-### What Gets Encrypted
+vsql-vault never sees plaintext. It never parses the blob. It doesn't care what algorithm was used. The blob is opaque bytes with metadata.
 
-Individual fields inside JSONB documents:
+### What vsql-vault governs
 
-```json
-// Before Vault:
-{
-  "merchant": "Acme Corp",
-  "amount": 49.99,
-  "card_number": "4111111111111111",
-  "cardholder_name": "Jane Doe"
-}
-
-// After Vault:
-{
-  "merchant": "Acme Corp",
-  "amount": 49.99,
-  "card_number": "vault:v1:AES256-GCM:keyid=7:base64ciphertext...",
-  "cardholder_name": "vault:v1:AES256-GCM:keyid=7:base64ciphertext..."
-}
-```
-
-`merchant` and `amount` stay queryable. `card_number` and `cardholder_name` are opaque ciphertext. Only Vault can decrypt them.
+- **Access policies.** Who stored this? Who can retrieve it? Under what contract?
+- **Retention policies.** When does it expire? What's the max retention? Auto-purge scheduling.
+- **Audit trail.** Every store, retrieve, and purge is logged with caller identity, timestamp, and grant/deny.
+- **Purge proof.** SHA-256 hash of the entry at time of deletion. Cryptographic proof it existed and was destroyed.
+- **Compliance evidence.** Point-in-time snapshots for your QSA: entries by purpose, key staleness, purge compliance, access summary.
 
 ---
 
@@ -100,160 +87,125 @@ Individual fields inside JSONB documents:
 ```toml
 # vsql-vault.toml
 
-[proxy]
-listen_addr = "127.0.0.1:5433"
-upstream_addr = "127.0.0.1:5432"    # VibeSQL Micro
+[server]
+listen_addr = "0.0.0.0:8443"
 
-[key_provider]
-provider = "local-dev"               # Development only
+[storage]
+database_url = "postgresql://vsql_vault@localhost:5432/vault"
 
-[key_provider.local_dev]
-passphrase_file = "./dev-keys.txt"   # NEVER use in production
+[auth]
+api_key_header = "X-Vault-Key"
+api_key_env = "VSQL_VAULT_API_KEY"
 
-[registry]
-database_url = "postgresql://postgres:postgres@localhost:5432/vibesql"
-refresh_interval_secs = 60
-
-[key_lifecycle]
-rotation_days = 90
-grace_period_days = 275
-total_lifetime_days = 365
-auto_reencrypt_on_access = true
+[purge]
+sweep_interval_hours = 24
+purge_proof_hash = true
 ```
 
 ### 3. Start Vault
 
 ```bash
-./vsql-vault --config vsql-vault.toml
-# Vault is running on :5433, proxying to Micro on :5432
+VSQL_VAULT_API_KEY=your-secret-key ./vsql-vault --config vsql-vault.toml
+# Vault API is running on :8443
 ```
 
-### 4. Register Sensitive Fields
-
-```sql
--- Connect to Micro directly for admin operations
-INSERT INTO vibe_audit.sensitive_fields
-    (schema_name, table_name, json_path, redact_in_log, encrypt_at_rest, key_purpose, description)
-VALUES
-    ('collections', 'payments', '$.card_number',     TRUE, TRUE, 'card',    'PAN — PCI DSS Req 3.3.2'),
-    ('collections', 'payments', '$.cardholder_name', TRUE, TRUE, 'general', 'Cardholder name — PII'),
-    ('collections', 'payments', '$.card_expiry',     TRUE, TRUE, 'card',    'Expiration date');
-```
-
-### 5. Connect Your App to Vault
+### 4. Set a Retention Policy
 
 ```bash
-# Point your app at Vault (:5433) instead of Micro (:5432)
-# Everything else is transparent
-psql -h localhost -p 5433 -d vibesql
+curl -X PUT http://localhost:8443/admin/retention-policies/card \
+  -H "X-Vault-Key: your-secret-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "max_retention_days": 365,
+    "default_ttl_days": 90,
+    "purge_method": "physical-delete",
+    "require_purge_proof": true,
+    "description": "Card tokens — max 1 year, default 90 days"
+  }'
 ```
 
-Queries go through Vault. Sensitive fields are encrypted on write, decrypted on read. Your application sees cleartext. PostgreSQL stores ciphertext.
+### 5. Store an Encrypted Blob
+
+```bash
+# Your encryption stack encrypts the data first.
+# Then store the opaque ciphertext in the vault.
+curl -X PUT http://localhost:8443/vault/card/payment-12345 \
+  -H "X-Vault-Key: your-secret-key" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "encrypted_value": "vault:v1:AES256-GCM:keyid=7:base64ciphertext...",
+    "algorithm_hint": "AES-256-GCM",
+    "key_ref": "akv:payez-kv:card-key-v7",
+    "metadata": { "merchant_id": 42 },
+    "expires_at": "2027-02-16T00:00:00Z",
+    "access_policy": "payment-service-only"
+  }'
+```
+
+### 6. Retrieve It
+
+```bash
+curl http://localhost:8443/vault/card/payment-12345 \
+  -H "X-Vault-Key: your-secret-key"
+
+# Returns the opaque blob + metadata. Your app decrypts it.
+```
 
 ---
 
-## Ciphertext Envelope
-
-```
-vault:v1:AES256-GCM:keyid={id}:{base64(nonce || ciphertext || tag)}
-```
-
-| Field | Purpose |
-|-------|---------|
-| `vault` | Prefix — identifies a Vault-encrypted value |
-| `v1` | Envelope version — future-proof for format changes |
-| `AES256-GCM` | Algorithm (AES-256-GCM, the only supported algorithm) |
-| `keyid={id}` | Key identifier — resolves to a specific version in the key provider |
-| `base64(...)` | 12-byte nonce + ciphertext + 16-byte GCM authentication tag |
-
-Self-describing. Decryption needs only the key provider — no external metadata.
-
----
-
-## Key Management
-
-Vault doesn't store keys. It delegates to a provider.
-
-### Providers
-
-| Provider | Use Case |
-|----------|----------|
-| `azure-keyvault` | Production with Azure. RSA 4096 wrapping, AES-256 symmetric. Managed identity or service principal. |
-| `hashicorp-vault` | Production with HashiCorp. Transit secrets engine. |
-| `aws-kms` | Production with AWS. KMS envelope encryption. |
-| `local-dev` | **Development only.** Keys from a local passphrase file. Logged on startup. |
-
-### Key Lifecycle
-
-```
-┌──────────┐    rotate     ┌──────────┐   grace expires  ┌──────────┐
-│ Current  │──────────────►│ Grace    │─────────────────►│ Retired  │
-│          │               │          │                   │          │
-│ encrypt  │               │ decrypt  │                   │ cannot   │
-│ + decrypt│               │ only     │                   │ decrypt  │
-└──────────┘               └──────────┘                   └──────────┘
-```
-
-Keys rotate automatically. During the grace period, Vault decrypts with the old key and re-encrypts with the current key on read. Documents naturally migrate to the current key through normal traffic. No downtime, no big-bang re-encryption.
-
----
-
-## Sensitive Field Registry
-
-Vault shares the `vibe_audit.sensitive_fields` table with [VibeSQL Audit](https://github.com/PayEz-Net/vibesql-audit). Register a field once — it's encrypted at rest (Req 3), access-logged with redaction (Req 10), and key-governed with evidence.
-
-| Column | Consumer | What It Does |
-|--------|----------|-------------|
-| `json_path` | Vault + Audit | Identifies the JSONB field |
-| `encrypt_at_rest = TRUE` | Vault | Encrypts this field before storage |
-| `redact_in_log = TRUE` | Audit | Masks this field in audit events |
-| `key_purpose` | Vault | Selects which key set to use |
-| `auto_reencrypt = TRUE` | Vault | Re-encrypt on grace-key access |
-
-One INSERT, two compliance requirements.
-
----
-
-## VibeSQL Audit Integration
-
-When deployed with [VibeSQL Audit](https://github.com/PayEz-Net/vibesql-audit), Vault creates a closed compliance loop:
-
-```
-vibe_audit.sensitive_fields (single registry)
-
-  ┌──────────────┐     ┌──────────────┐
-  │ VibeSQL      │     │ VibeSQL      │
-  │ Audit        │     │ Vault        │
-  │ (Req 10)     │     │ (Req 3)      │
-  │              │     │              │
-  │ "access was  │     │ "data is     │
-  │  logged and  │     │  encrypted   │
-  │  field was   │     │  at rest     │
-  │  redacted"   │     │  with key Y" │
-  └──────────────┘     └──────────────┘
-```
-
-- **WAL capture sees ciphertext.** Audit's WAL logical decoding never sees cardholder data — it's already encrypted. Defense in depth.
-- **Re-encryption events emit to Audit.** When Vault rotates a key and re-encrypts a field, the event is logged.
-- **Shared registry.** One registration covers both encryption and audit.
-
----
-
-## Admin API
-
-Local HTTP API on port 9100. Localhost only. Requires API key.
+## API
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| `GET` | `/health` | Key provider reachable, keys available, registry loaded |
-| `GET` | `/health/ready` | Readiness probe (also checks upstream VibeSQL) |
-| `GET` | `/metrics` | Prometheus metrics — encrypt/decrypt counts, latency, cache hit rates |
-| `GET` | `/v1/keys` | Active key sets per purpose (IDs only, no material) |
-| `POST` | `/v1/keys/rotate` | Trigger immediate key rotation |
-| `GET` | `/v1/fields` | List registered sensitive fields |
-| `POST` | `/v1/fields` | Register a new sensitive field |
-| `POST` | `/v1/reencrypt` | Trigger bulk re-encryption sweep |
-| `GET` | `/v1/compliance/report` | PCI Req 3 compliance evidence snapshot |
+| `PUT` | `/vault/{purpose}/{external_id}` | Store an encrypted blob |
+| `GET` | `/vault/{purpose}/{external_id}` | Retrieve (if authorized) |
+| `DELETE` | `/vault/{purpose}/{external_id}` | Manually purge an entry |
+| `HEAD` | `/vault/{purpose}/{external_id}` | Check existence + expiry (no blob) |
+| `GET` | `/vault/{purpose}` | List entries for a purpose (metadata only) |
+| `PUT` | `/admin/retention-policies/{purpose}` | Create/update retention policy |
+| `PUT` | `/admin/access-policies/{name}` | Create/update access policy |
+| `GET` | `/admin/access-log` | Query access log |
+| `GET` | `/admin/purge-log` | Query purge log |
+| `POST` | `/admin/purge/sweep` | Trigger manual purge sweep |
+| `GET` | `/compliance/report` | PCI Req 3 compliance evidence snapshot |
+| `GET` | `/health` | Health check |
+| `GET` | `/metrics` | Prometheus metrics |
+
+---
+
+## Access Policies
+
+Who can store and retrieve entries.
+
+| Policy | Store | Retrieve | Description |
+|--------|-------|----------|-------------|
+| `owner-only` | Any authenticated | Only the `owner_app` that stored it | Default — only the storer can retrieve |
+| `same-purpose` | Any authenticated | Any app with the same purpose | Shared access within a purpose |
+| `open-retrieve` | Any authenticated | Any authenticated caller | Store controlled, retrieve open |
+| `admin-only` | Admin apps | Admin apps | Locked down for regulatory data |
+
+Custom policies define rules per operation with `allowed_apps`, `require_identity`, and `max_retrievals`.
+
+---
+
+## Retention Policies
+
+How long data can be stored. What happens when it expires.
+
+| Enforcement | What Happens |
+|-------------|-------------|
+| Store request exceeds `max_retention_days` | Rejected with 422 |
+| No `expires_at` provided | Set to `NOW() + default_ttl_days` |
+| Entry expires | Purge sweep deletes it per `purge_method` |
+| Retrieve expired entry | Returns 410 Gone |
+
+### Purge Methods
+
+| Method | Action | Proof |
+|--------|--------|-------|
+| `physical-delete` | Row deleted. SHA-256 proof written to `purge_log`. | Hash of entry at time of purge |
+| `crypto-shred` | Value zeroed in place. Row kept with `purged_at` set. | Zeroed value + purge log entry |
+| `retention-expire` | Same as physical-delete, reason marked as retention policy. | Purge log with policy reference |
 
 ---
 
@@ -261,30 +213,61 @@ Local HTTP API on port 9100. Localhost only. Requires API key.
 
 | PCI Req | Requirement | Vault Control |
 |---------|-------------|---------------|
-| **3.3.2** | PAN rendered unreadable anywhere stored | AES-256-GCM via vault envelope. PAN is opaque ciphertext in PostgreSQL. |
-| **3.5.1** | Cryptographic key access restricted | Key material in provider (Azure KV / HashiCorp / AWS KMS). Vault retrieves on demand, caches with TTL. No keys on disk. |
-| **3.5.1.1** | Key access restricted to fewest custodians | Provider RBAC. Vault service identity has encrypt/decrypt only — no export. |
-| **3.6.1** | Key management procedures implemented | Lifecycle config: rotation, grace period, retirement — all automated. |
-| **3.6.1.1** | Strong cryptographic key generation | Provider's certified RNG (FIPS 140-2 Level 2/3 for Azure HSM). |
-| **3.6.1.2** | Secure key distribution | Keys never leave the provider. TLS in transit. `zeroize` + `mlock` in memory. |
-| **3.6.1.4** | Key changes at end of cryptoperiod | Automatic rotation per config. Auto re-encrypt on read migrates data. Bulk re-encrypt API for immediate sweep. |
-| **3.7.1** | Key management policies documented | `/v1/compliance/report` generates full policy, key states, rotation history. |
+| **3.1.1** | Data retention policies | Retention policies per purpose with max_retention_days and enforced TTL |
+| **3.1.2** | Data limited to what is needed | Purpose-scoped storage with expiry. Purge sweep enforces removal. |
+| **3.3.2** | PAN rendered unreadable | Vault stores already-encrypted values. Never sees plaintext. |
+| **3.5.1** | Access to crypto keys restricted | Vault doesn't hold keys. Keys are in Azure KV / HC Vault / AWS KMS. |
+| **3.6.1.4** | Key changes at cryptoperiod end | Tracks `key_ref` per entry. Reports entries on stale keys. |
+| **3.7.1** | Key management policies documented | `/compliance/report` generates policy, key states, purge compliance. |
 
 ---
 
-## Searchable Encryption (Blind Indexes)
+## Compliance Report
 
-Encrypted fields can't be queried directly. For lookup-by-value, Vault supports blind indexes — HMAC-based hashes stored alongside the ciphertext.
+`GET /compliance/report` generates a point-in-time snapshot:
 
-```sql
--- Application sends:
-SELECT * FROM collections.payments WHERE data->>'card_number' = '4111111111111111';
-
--- Vault rewrites to:
-SELECT * FROM collections.payments WHERE data->>'card_number__idx' = 'bidx:v1:HMAC-SHA256:computed_hash';
+```json
+{
+  "summary": {
+    "total_entries": 12847,
+    "active_entries": 11203,
+    "expired_pending_purge": 44,
+    "purged_last_30_days": 1600
+  },
+  "by_purpose": {
+    "card": {
+      "active": 8200,
+      "retention_policy": "365 days max, 90 day default TTL",
+      "entries_expiring_next_30_days": 320,
+      "key_refs": {
+        "akv:payez-kv:card-key-v7": 7800,
+        "akv:payez-kv:card-key-v6": 400
+      }
+    }
+  },
+  "purge_compliance": {
+    "purge_sweep_last_run": "2026-02-16T04:00:00Z",
+    "entries_purged_last_sweep": 12,
+    "purge_proof_available": true
+  }
+}
 ```
 
-Equality only. No range queries, no LIKE. Optional per-field.
+Hand this to your QSA. Requirement 3 evidence, generated automatically.
+
+---
+
+## Security Posture
+
+| Layer | Control |
+|-------|---------|
+| Container | FROM scratch — no shell, no package manager, no utilities |
+| Network | Pod-internal PostgreSQL. Only vault API port exposed. TLS required. |
+| Storage | VibeSQL Micro on dedicated disk. Not shared with application data. |
+| Auth | mTLS, JWT with JWKS validation, or API key. No anonymous access. |
+| Authorization | Per-entry access policies. Every operation logged. |
+| Memory | Rust — no GC, `zeroize` for sensitive buffers, `mlock` to prevent swap |
+| Audit | Every operation logged to `vault.access_log`. Immutable. |
 
 ---
 
@@ -292,29 +275,23 @@ Equality only. No range queries, no LIKE. Optional per-field.
 
 | Operation | Target |
 |-----------|--------|
-| Passthrough (no sensitive fields) | < 100μs |
-| Encrypt one JSONB field | < 50μs |
-| Decrypt one JSONB field | < 50μs |
-| Transform 5-field document | < 300μs |
-| Key provider retrieval (cache miss) | < 200ms (network bound) |
-
-Written in Rust. Key material uses `zeroize` — zeroed on drop, no lingering cleartext. `mlock` prevents swap to disk. No garbage collector.
+| Store (PUT) | < 5ms |
+| Retrieve (GET) | < 3ms |
+| HEAD (exists check) | < 2ms |
+| Purge sweep (1000 entries) | < 10s |
+| Compliance report | < 5s |
 
 ---
 
-## Configuration Reference
+## Storage Tables
 
-### Environment Variables
-
-| Variable | Purpose |
-|----------|---------|
-| `VSQL_VAULT_AZURE_CLIENT_SECRET` | Azure service principal secret |
-| `VSQL_VAULT_HC_TOKEN` | HashiCorp Vault token |
-| `VSQL_VAULT_HC_SECRET_ID` | HashiCorp AppRole secret ID |
-| `VSQL_VAULT_ADMIN_KEY` | Admin API authentication key |
-| `VSQL_VAULT_DB_PASSWORD` | Registry database password |
-
-Secrets are never in the config file.
+```
+vault.entries            — Encrypted blobs with metadata, TTL, access policy
+vault.access_log         — Every store/retrieve/purge logged with caller + grant/deny
+vault.access_policies    — Named access contracts (who can store/retrieve/purge)
+vault.retention_policies — Per-purpose TTL, max retention, purge method
+vault.purge_log          — Proof of deletion (SHA-256 hash, method, reason)
+```
 
 ---
 
