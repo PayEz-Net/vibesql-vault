@@ -31,6 +31,8 @@ toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 base64 = "0.22"
 constant_time_eq = "0.3"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
 
 [dev-dependencies]
 vsql-vault-core = { path = "../vsql-vault-core" }

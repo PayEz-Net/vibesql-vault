@@ -18,10 +18,19 @@ pub struct Config {
 pub struct ServerConfig {
     #[serde(default = "default_listen_addr")]
     pub listen_addr: String,
+    #[serde(default = "default_mode")]
+    pub mode: String,
     #[serde(default = "default_request_timeout")]
     pub request_timeout_secs: u64,
     #[serde(default = "default_max_body_bytes")]
     pub max_body_bytes: usize,
+    pub tls: Option<TlsConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TlsConfig {
+    pub cert_path: String,
+    pub key_path: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -58,9 +67,15 @@ pub struct LoggingConfig {
 fn default_server() -> ServerConfig {
     ServerConfig {
         listen_addr: default_listen_addr(),
+        mode: default_mode(),
         request_timeout_secs: default_request_timeout(),
         max_body_bytes: default_max_body_bytes(),
+        tls: None,
     }
+}
+
+fn default_mode() -> String {
+    "dev".into()
 }
 
 fn default_listen_addr() -> String {
@@ -124,7 +139,37 @@ impl Config {
     pub fn from_file(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string(path)?;
         let config: Config = toml::from_str(&content)?;
+        config.validate()?;
         Ok(config)
+    }
+
+    pub fn from_toml(s: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let config: Config = toml::from_str(s)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+        match self.server.mode.as_str() {
+            "dev" => Ok(()),
+            "prod" => {
+                let tls = self
+                    .server
+                    .tls
+                    .as_ref()
+                    .ok_or("mode = 'prod' requires [server.tls] with cert_path and key_path")?;
+                if tls.cert_path.is_empty() {
+                    return Err("tls.cert_path must not be empty in prod mode".into());
+                }
+                if tls.key_path.is_empty() {
+                    return Err("tls.key_path must not be empty in prod mode".into());
+                }
+                Ok(())
+            }
+            other => {
+                Err(format!("unknown server mode: '{other}' (expected 'dev' or 'prod')").into())
+            }
+        }
     }
 
     pub fn database_url(&self) -> &str {
@@ -185,5 +230,94 @@ format = "text"
         assert_eq!(config.auth.api_key_env, "MY_KEY");
         assert!(!config.purge.enabled);
         assert_eq!(config.logging.level, "debug");
+    }
+
+    #[test]
+    fn test_dev_mode_without_tls_ok() {
+        let toml_str = r#"
+[database]
+url = "postgresql://user@localhost/db"
+
+[server]
+mode = "dev"
+"#;
+        let config = Config::from_toml(toml_str).unwrap();
+        assert_eq!(config.server.mode, "dev");
+        assert!(config.server.tls.is_none());
+    }
+
+    #[test]
+    fn test_prod_mode_without_tls_errors() {
+        let toml_str = r#"
+[database]
+url = "postgresql://user@localhost/db"
+
+[server]
+mode = "prod"
+"#;
+        let result = Config::from_toml(toml_str);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("prod"), "error should mention prod: {err}");
+    }
+
+    #[test]
+    fn test_prod_mode_with_tls_ok() {
+        let toml_str = r#"
+[database]
+url = "postgresql://user@localhost/db"
+
+[server]
+mode = "prod"
+
+[server.tls]
+cert_path = "/etc/ssl/cert.pem"
+key_path = "/etc/ssl/key.pem"
+"#;
+        let config = Config::from_toml(toml_str).unwrap();
+        assert_eq!(config.server.mode, "prod");
+        let tls = config.server.tls.unwrap();
+        assert_eq!(tls.cert_path, "/etc/ssl/cert.pem");
+        assert_eq!(tls.key_path, "/etc/ssl/key.pem");
+    }
+
+    #[test]
+    fn test_prod_mode_empty_cert_path_errors() {
+        let toml_str = r#"
+[database]
+url = "postgresql://user@localhost/db"
+
+[server]
+mode = "prod"
+
+[server.tls]
+cert_path = ""
+key_path = "/etc/ssl/key.pem"
+"#;
+        let result = Config::from_toml(toml_str);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("cert_path"),
+            "error should mention cert_path: {err}"
+        );
+    }
+
+    #[test]
+    fn test_unknown_mode_errors() {
+        let toml_str = r#"
+[database]
+url = "postgresql://user@localhost/db"
+
+[server]
+mode = "staging"
+"#;
+        let result = Config::from_toml(toml_str);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("staging"),
+            "error should mention the invalid mode: {err}"
+        );
     }
 }

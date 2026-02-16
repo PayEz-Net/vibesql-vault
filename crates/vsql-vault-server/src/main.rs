@@ -12,7 +12,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use tracing_subscriber::{fmt, EnvFilter};
 
 use vsql_vault_server::api;
-use vsql_vault_server::config::Config;
+use vsql_vault_server::config::{Config, TlsConfig};
 use vsql_vault_server::health;
 use vsql_vault_server::middleware::{self, ApiKey};
 use vsql_vault_server::pg_storage::PgStorage;
@@ -26,6 +26,61 @@ use vsql_vault_server::state::AppState;
 struct Cli {
     #[arg(short, long, default_value = "vsql-vault.toml")]
     config: String,
+}
+
+fn load_tls_config(
+    tls: &TlsConfig,
+) -> Result<tokio_rustls::rustls::ServerConfig, Box<dyn std::error::Error>> {
+    let cert_file = std::fs::File::open(&tls.cert_path)
+        .map_err(|e| format!("failed to open cert_path '{}': {e}", tls.cert_path))?;
+    let key_file = std::fs::File::open(&tls.key_path)
+        .map_err(|e| format!("failed to open key_path '{}': {e}", tls.key_path))?;
+
+    let certs: Vec<_> = rustls_pemfile::certs(&mut std::io::BufReader::new(cert_file))
+        .collect::<Result<Vec<_>, _>>()?;
+    if certs.is_empty() {
+        return Err("no certificates found in cert_path".into());
+    }
+
+    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(key_file))?
+        .ok_or("no private key found in key_path")?;
+
+    let config = tokio_rustls::rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)?;
+
+    Ok(config)
+}
+
+struct TlsListener {
+    inner: TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+}
+
+impl axum::serve::Listener for TlsListener {
+    type Io = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.inner.accept().await {
+                Ok((stream, addr)) => match self.acceptor.accept(stream).await {
+                    Ok(tls) => return (tls, addr),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "TLS handshake failed");
+                    }
+                },
+                Err(e) => {
+                    tracing::error!(error = %e, "TCP accept failed");
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
 }
 
 #[tokio::main]
@@ -115,11 +170,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_state(app_state);
 
     let listener = TcpListener::bind(&config.server.listen_addr).await?;
-    tracing::info!(addr = %config.server.listen_addr, "vsql-vault listening");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    match config.server.mode.as_str() {
+        "dev" => {
+            tracing::warn!("running in dev mode \u{2014} HTTP only, not for production use");
+            tracing::info!(addr = %config.server.listen_addr, "vsql-vault listening (HTTP)");
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown_signal())
+                .await?;
+        }
+        "prod" => {
+            let tls = config
+                .server
+                .tls
+                .as_ref()
+                .expect("validated: prod requires [server.tls]");
+            let tls_config = load_tls_config(tls)?;
+            let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(tls_config));
+            tracing::info!(addr = %config.server.listen_addr, "vsql-vault listening (HTTPS/TLS)");
+            let tls_listener = TlsListener {
+                inner: listener,
+                acceptor,
+            };
+            axum::serve(tls_listener, app)
+                .with_graceful_shutdown(shutdown_signal())
+                .await?;
+        }
+        _ => unreachable!("config validation catches unknown modes"),
+    }
 
     Ok(())
 }

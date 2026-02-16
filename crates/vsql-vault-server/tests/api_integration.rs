@@ -14,12 +14,27 @@ use uuid::Uuid;
 use vsql_vault_core::memory::MemoryStorage;
 use vsql_vault_core::retention::RetentionPolicy;
 
-fn build_app(api_key: &str) -> (Router, Arc<vsql_vault_server::state::AppState>) {
+async fn build_app(api_key: &str) -> (Router, Arc<vsql_vault_server::state::AppState>) {
     let storage = MemoryStorage::new();
     let state = Arc::new(vsql_vault_server::state::AppState {
         storage: Box::new(storage),
         max_body_bytes: 1_048_576,
     });
+
+    // Seed default retention policy for "card" purpose (required for store)
+    state
+        .storage
+        .upsert_retention_policy(&RetentionPolicy {
+            id: None,
+            purpose: "card".into(),
+            max_retention_days: 365,
+            default_ttl_days: Some(90),
+            purge_method: "physical-delete".into(),
+            require_purge_proof: true,
+            description: None,
+        })
+        .await
+        .unwrap();
 
     let vault_routes = Router::new()
         .route(
@@ -106,7 +121,7 @@ fn store_body_with_expiry(owner: &str, expires_at: &str) -> String {
 
 #[tokio::test]
 async fn test_health() {
-    let (app, _) = build_app("test-key");
+    let (app, _) = build_app("test-key").await;
     let resp = app
         .oneshot(
             Request::builder()
@@ -121,7 +136,7 @@ async fn test_health() {
 
 #[tokio::test]
 async fn test_store_and_retrieve() {
-    let (app, _) = build_app("test-key");
+    let (app, _) = build_app("test-key").await;
     let id = Uuid::new_v4();
 
     let resp = app
@@ -154,7 +169,7 @@ async fn test_store_and_retrieve() {
 
 #[tokio::test]
 async fn test_store_response_includes_access_policy() {
-    let (app, _) = build_app("test-key");
+    let (app, _) = build_app("test-key").await;
     let id = Uuid::new_v4();
 
     let resp = app
@@ -181,7 +196,7 @@ async fn test_store_response_includes_access_policy() {
 
 #[tokio::test]
 async fn test_unauthorized() {
-    let (app, _) = build_app("correct-key");
+    let (app, _) = build_app("correct-key").await;
     let id = Uuid::new_v4();
 
     let resp = app
@@ -201,7 +216,7 @@ async fn test_unauthorized() {
 
 #[tokio::test]
 async fn test_missing_auth() {
-    let (app, _) = build_app("test-key");
+    let (app, _) = build_app("test-key").await;
     let id = Uuid::new_v4();
 
     let resp = app
@@ -220,7 +235,7 @@ async fn test_missing_auth() {
 
 #[tokio::test]
 async fn test_not_found() {
-    let (app, _) = build_app("test-key");
+    let (app, _) = build_app("test-key").await;
     let id = Uuid::new_v4();
 
     let resp = app
@@ -238,7 +253,7 @@ async fn test_not_found() {
 
 #[tokio::test]
 async fn test_delete() {
-    let (app, _) = build_app("test-key");
+    let (app, _) = build_app("test-key").await;
     let id = Uuid::new_v4();
 
     let _ = app
@@ -284,7 +299,7 @@ async fn test_delete() {
 
 #[tokio::test]
 async fn test_delete_not_found() {
-    let (app, _) = build_app("test-key");
+    let (app, _) = build_app("test-key").await;
     let id = Uuid::new_v4();
 
     let resp = app
@@ -303,7 +318,7 @@ async fn test_delete_not_found() {
 
 #[tokio::test]
 async fn test_purpose_isolation() {
-    let (app, _) = build_app("test-key");
+    let (app, _) = build_app("test-key").await;
     let id = Uuid::new_v4();
 
     let _ = app
@@ -335,7 +350,7 @@ async fn test_purpose_isolation() {
 
 #[tokio::test]
 async fn test_head_entry() {
-    let (app, _) = build_app("test-key");
+    let (app, _) = build_app("test-key").await;
     let id = Uuid::new_v4();
 
     // Store an entry
@@ -373,7 +388,7 @@ async fn test_head_entry() {
 
 #[tokio::test]
 async fn test_head_not_found() {
-    let (app, _) = build_app("test-key");
+    let (app, _) = build_app("test-key").await;
     let id = Uuid::new_v4();
 
     let resp = app
@@ -392,7 +407,7 @@ async fn test_head_not_found() {
 
 #[tokio::test]
 async fn test_retention_policy_enforcement() {
-    let (app, state) = build_app("test-key");
+    let (app, state) = build_app("test-key").await;
     let id = Uuid::new_v4();
 
     // Create a retention policy: max 30 days for "card" purpose
@@ -454,7 +469,7 @@ async fn test_retention_policy_enforcement() {
 
 #[tokio::test]
 async fn test_admin_retention_policies() {
-    let (app, _) = build_app("test-key");
+    let (app, _) = build_app("test-key").await;
 
     // PUT a retention policy
     let resp = app
@@ -497,7 +512,7 @@ async fn test_admin_retention_policies() {
 
 #[tokio::test]
 async fn test_admin_purge_log() {
-    let (app, _) = build_app("test-key");
+    let (app, _) = build_app("test-key").await;
     let id = Uuid::new_v4();
 
     // Store and delete to create a purge log entry
@@ -557,7 +572,7 @@ async fn test_admin_purge_log() {
 
 #[tokio::test]
 async fn test_caller_identity_from_header() {
-    let (app, _) = build_app("test-key");
+    let (app, _) = build_app("test-key").await;
     let id = Uuid::new_v4();
 
     // Store with X-Vault-Caller header
@@ -593,7 +608,7 @@ async fn test_caller_identity_from_header() {
 
 #[tokio::test]
 async fn test_stored_access_policy_returned() {
-    let (app, _) = build_app("test-key");
+    let (app, _) = build_app("test-key").await;
     let id = Uuid::new_v4();
 
     // Store with explicit access_policy
@@ -652,7 +667,7 @@ async fn test_stored_access_policy_returned() {
 
 #[tokio::test]
 async fn test_purge_expired_generates_proof() {
-    let (_, state) = build_app("test-key");
+    let (_, state) = build_app("test-key").await;
 
     // Store an entry that's already expired
     let entry = vsql_vault_core::entry::VaultEntry {
@@ -686,4 +701,34 @@ async fn test_purge_expired_generates_proof() {
     assert!(logs[0].proof_hash.as_ref().unwrap().starts_with("sha256:"));
     assert_eq!(logs[0].purge_reason, "ttl-expired");
     assert_eq!(logs[0].purge_method.to_string(), "retention-expire");
+}
+
+#[tokio::test]
+async fn test_store_rejected_without_retention_policy() {
+    let (app, _) = build_app("test-key").await;
+    let id = Uuid::new_v4();
+
+    // Store to "pii" purpose — no retention policy exists → 422
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/v1/vault/pii/{id}"))
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer test-key")
+                .body(Body::from(store_body("payez")))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let body = axum::body::to_bytes(resp.into_body(), 1_048_576)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["error"]
+        .as_str()
+        .unwrap()
+        .contains("no retention policy configured for purpose 'pii'"));
 }

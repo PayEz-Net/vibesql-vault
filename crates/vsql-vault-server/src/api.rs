@@ -177,39 +177,64 @@ pub async fn store_entry(
         }
     }
 
-    // Retention policy enforcement
-    let mut effective_expires_at = body.expires_at;
-    if let Ok(Some(retention)) = state.storage.get_retention_policy(&purpose).await {
-        match retention.validate_expiry(body.expires_at) {
-            RetentionDecision::Accept { expires_at } => {
-                effective_expires_at = expires_at;
+    // Retention policy enforcement — mandatory: reject if no policy configured
+    let retention = match state.storage.get_retention_policy(&purpose).await {
+        Ok(Some(policy)) => policy,
+        Ok(None) => {
+            let reason = format!("no retention policy for purpose '{purpose}'");
+            if let Err(resp) = audit_log(
+                &state,
+                AccessLogEntry::denied(
+                    Some(entry_id),
+                    &purpose,
+                    Operation::Store,
+                    caller_app,
+                    &reason,
+                ),
+            )
+            .await
+            {
+                return resp;
             }
-            RetentionDecision::Reject { reason } => {
-                if let Err(resp) = audit_log(
-                    &state,
-                    AccessLogEntry::denied(
-                        Some(entry_id),
-                        &purpose,
-                        Operation::Store,
-                        caller_app,
-                        &reason,
-                    ),
-                )
-                .await
-                {
-                    return resp;
-                }
-                return (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(serde_json::json!({
-                        "error": reason,
-                        "code": 422
-                    })),
-                )
-                    .into_response();
-            }
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": format!("no retention policy configured for purpose '{}' — create one via PUT /admin/retention-policies/{} before storing entries", purpose, purpose),
+                    "code": 422
+                })),
+            )
+                .into_response();
         }
-    }
+        Err(e) => return vault_error_response(&e),
+    };
+
+    let effective_expires_at = match retention.validate_expiry(body.expires_at) {
+        RetentionDecision::Accept { expires_at } => expires_at,
+        RetentionDecision::Reject { reason } => {
+            if let Err(resp) = audit_log(
+                &state,
+                AccessLogEntry::denied(
+                    Some(entry_id),
+                    &purpose,
+                    Operation::Store,
+                    caller_app,
+                    &reason,
+                ),
+            )
+            .await
+            {
+                return resp;
+            }
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "error": reason,
+                    "code": 422
+                })),
+            )
+                .into_response();
+        }
+    };
 
     let now = Utc::now();
     let entry = VaultEntry {
