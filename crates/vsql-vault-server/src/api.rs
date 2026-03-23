@@ -633,6 +633,30 @@ pub async fn touch_entry(
     };
 
     let req = body.map(|b| b.0).unwrap_or(TouchRequest { extend_ttl: false, key_ref: None });
+    let caller_app = &auth.caller_id;
+
+    // Enforce access policy before allowing touch (same as retrieve)
+    match state.storage.retrieve(&purpose, &id).await {
+        Ok(Some(entry)) => {
+            let policy_name = &entry.access_policy;
+            if let Ok(Some(policy)) = state.storage.get_access_policy(policy_name).await {
+                let decision = policy.can_retrieve(caller_app, &entry.metadata.owner_app);
+                if !decision.is_allowed() {
+                    let reason = match decision {
+                        vsql_vault_core::access_policy::PolicyDecision::Deny(r) => r,
+                        _ => "denied".into(),
+                    };
+                    let _ = audit_log(
+                        &state,
+                        AccessLogEntry::denied(Some(id), &purpose, Operation::Retrieve, caller_app, &reason),
+                    ).await;
+                    return (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "access denied", "reason": reason}))).into_response();
+                }
+            }
+        }
+        Ok(None) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "entry not found or purged"}))).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response(),
+    }
 
     match state.storage.touch(&purpose, &id, req.extend_ttl, req.key_ref.as_deref()).await {
         Ok(Some(result)) => {

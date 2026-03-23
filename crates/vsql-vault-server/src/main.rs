@@ -163,8 +163,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/sweep", post(api::admin_sweep))
         .layer(axum_mw::from_fn(middleware::auth_middleware));
 
+    // Vault admin routes under /v1/vault/admin (spec path)
+    let vault_admin_routes = Router::new()
+        .route("/sweep", post(api::admin_sweep))
+        .layer(axum_mw::from_fn(middleware::auth_middleware));
+
     let app = Router::new()
         .nest("/v1/vault", vault_routes)
+        .nest("/v1/vault/admin", vault_admin_routes)
         .nest("/admin", admin_routes)
         .route("/health", get(health::health))
         .route("/health/ready", get(health::ready))
