@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::{
     middleware as axum_mw,
-    routing::{delete, get, head, put},
+    routing::{delete, get, head, patch, post, put},
     Router,
 };
 use clap::Parser;
@@ -126,13 +126,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if config.purge.enabled {
         let purge_state = app_state.clone();
         let interval = config.purge.interval_secs;
+        let auto_delete = config.purge.auto_delete;
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval));
             loop {
                 ticker.tick().await;
-                match purge_state.storage.purge_expired().await {
-                    Ok(0) => {}
-                    Ok(n) => tracing::info!(purged = n, "purged expired entries"),
+                match purge_state.storage.purge_expired(auto_delete).await {
+                    Ok(r) if r.deleted == 0 && r.dry_run_candidates == 0 => {}
+                    Ok(r) => tracing::info!(deleted = r.deleted, dry_run = r.dry_run_candidates, "purge sweep complete"),
                     Err(e) => tracing::error!(error = %e, "purge failed"),
                 }
             }
@@ -145,6 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/{purpose}/{entry_id}", get(api::retrieve_entry))
         .route("/{purpose}/{entry_id}", delete(api::delete_entry))
         .route("/{purpose}/{entry_id}", head(api::head_entry))
+        .route("/{purpose}/{entry_id}", patch(api::touch_entry))
         .route("/{purpose}", get(api::list_entries))
         .layer(axum_mw::from_fn(middleware::auth_middleware));
 
@@ -158,6 +160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/access-policies", get(api::list_access_policies))
         .route("/access-policies/{name}", put(api::upsert_access_policy))
         .route("/purge-log", get(api::list_purge_log))
+        .route("/sweep", post(api::admin_sweep))
         .layer(axum_mw::from_fn(middleware::auth_middleware));
 
     let app = Router::new()

@@ -5,9 +5,9 @@ use uuid::Uuid;
 
 use vsql_vault_core::access_log::AccessLogEntry;
 use vsql_vault_core::access_policy::AccessPolicy;
-use vsql_vault_core::entry::{VaultEntry, VaultEntrySummary, VaultMetadata};
+use vsql_vault_core::entry::{TouchResult, VaultEntry, VaultEntrySummary, VaultMetadata};
 use vsql_vault_core::error::VaultError;
-use vsql_vault_core::purge::{PurgeLogEntry, PurgeMethod};
+use vsql_vault_core::purge::{PurgeLogEntry, PurgeMethod, PurgeSweepResult};
 use vsql_vault_core::retention::RetentionPolicy;
 use vsql_vault_core::storage::VaultStorage;
 
@@ -30,8 +30,8 @@ impl VaultStorage for PgStorage {
         sqlx::query(
             r#"
             INSERT INTO vsql_vault.vault_entries
-                (id, purpose, encrypted_blob, owner_app, encryption_svc, content_type, tags, created_at, updated_at, expires_at, access_policy)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                (id, purpose, encrypted_blob, owner_app, encryption_svc, content_type, tags, created_at, updated_at, expires_at, last_used_at, access_policy)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             ON CONFLICT (purpose, id) DO UPDATE SET
                 encrypted_blob = EXCLUDED.encrypted_blob,
                 owner_app = EXCLUDED.owner_app,
@@ -40,6 +40,7 @@ impl VaultStorage for PgStorage {
                 tags = EXCLUDED.tags,
                 updated_at = EXCLUDED.updated_at,
                 expires_at = EXCLUDED.expires_at,
+                last_used_at = EXCLUDED.last_used_at,
                 access_policy = EXCLUDED.access_policy
             "#,
         )
@@ -53,6 +54,7 @@ impl VaultStorage for PgStorage {
         .bind(entry.created_at)
         .bind(entry.updated_at)
         .bind(entry.expires_at)
+        .bind(entry.last_used_at)
         .bind(&entry.access_policy)
         .execute(&self.pool)
         .await
@@ -62,13 +64,15 @@ impl VaultStorage for PgStorage {
     }
 
     async fn retrieve(&self, purpose: &str, id: &Uuid) -> Result<Option<VaultEntry>, VaultError> {
+        // Auto-stamp last_used_at on every retrieve (unconditional per spec)
         let row = sqlx::query_as::<_, EntryRow>(
             r#"
-            SELECT id, purpose, encrypted_blob, owner_app, encryption_svc, content_type, tags,
-                   created_at, updated_at, expires_at, access_policy
-            FROM vsql_vault.vault_entries
+            UPDATE vsql_vault.vault_entries
+            SET last_used_at = NOW()
             WHERE purpose = $1 AND id = $2
               AND (expires_at IS NULL OR expires_at > NOW())
+            RETURNING id, purpose, encrypted_blob, owner_app, encryption_svc, content_type, tags,
+                      created_at, updated_at, expires_at, last_used_at, access_policy
             "#,
         )
         .bind(purpose)
@@ -113,7 +117,7 @@ impl VaultStorage for PgStorage {
 
         let rows = sqlx::query_as::<_, SummaryRow>(
             r#"
-            SELECT id, purpose, owner_app, encryption_svc, content_type, tags, created_at, expires_at
+            SELECT id, purpose, owner_app, encryption_svc, content_type, tags, created_at, expires_at, last_used_at
             FROM vsql_vault.vault_entries
             WHERE purpose = $1
               AND (expires_at IS NULL OR expires_at > NOW())
@@ -132,29 +136,174 @@ impl VaultStorage for PgStorage {
         Ok((summaries, total.0 as u64))
     }
 
-    async fn purge_expired(&self) -> Result<u64, VaultError> {
+    async fn touch(
+        &self,
+        purpose: &str,
+        id: &Uuid,
+        extend_ttl: bool,
+        key_ref: Option<&str>,
+    ) -> Result<Option<TouchResult>, VaultError> {
+        use vsql_vault_core::entry::TouchResult;
+
+        // Always stamp last_used_at. Optionally extend TTL and/or update key_ref.
+        let now = Utc::now();
+
+        // First check the entry exists
+        let exists: Option<(chrono::DateTime<Utc>, Option<chrono::DateTime<Utc>>, Option<String>,)> = sqlx::query_as(
+            r#"
+            SELECT created_at, expires_at, key_ref
+            FROM vsql_vault.vault_entries
+            WHERE purpose = $1 AND id = $2
+              AND purged_at IS NULL
+              AND (expires_at IS NULL OR expires_at > NOW())
+            "#,
+        )
+        .bind(purpose)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| VaultError::Storage(e.to_string()))?;
+
+        let (_created_at, current_expires, current_key_ref) = match exists {
+            Some(row) => row,
+            None => return Ok(None),
+        };
+
+        // Calculate new expires_at if extending TTL
+        let new_expires = if extend_ttl {
+            // Fetch retention policy for this purpose
+            let policy = self.get_retention_policy(purpose).await?;
+            match policy {
+                Some(p) => {
+                    match p.default_ttl_days {
+                        Some(ttl) => Some(now + chrono::Duration::days(ttl as i64)),
+                        None => current_expires, // stripe-pm: null TTL = no-op
+                    }
+                }
+                None => current_expires,
+            }
+        } else {
+            current_expires
+        };
+
+        let new_key_ref = key_ref.map(|k| k.to_string()).or(current_key_ref);
+
+        let row: (chrono::DateTime<Utc>, Option<chrono::DateTime<Utc>>, chrono::DateTime<Utc>) = sqlx::query_as(
+            r#"
+            UPDATE vsql_vault.vault_entries
+            SET last_used_at = $3, updated_at = $3, expires_at = $4, key_ref = $5
+            WHERE purpose = $1 AND id = $2
+            RETURNING last_used_at, expires_at, updated_at
+            "#,
+        )
+        .bind(purpose)
+        .bind(id)
+        .bind(now)
+        .bind(new_expires)
+        .bind(&new_key_ref)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| VaultError::Storage(e.to_string()))?;
+
+        Ok(Some(TouchResult {
+            id: *id,
+            purpose: purpose.to_string(),
+            last_used_at: row.0,
+            expires_at: row.1,
+            key_ref: new_key_ref,
+            updated_at: row.2,
+        }))
+    }
+
+    async fn purge_expired(&self, auto_delete: bool) -> Result<PurgeSweepResult, VaultError> {
+        use vsql_vault_core::purge::{PurgeSweepResult, PurgeSweepCandidate};
+
+        // Dual-condition purge query: inactivity OR hard ceiling
+        let purge_where = r#"
+            purged_at IS NULL AND (
+              (expires_at IS NOT NULL AND expires_at <= NOW())
+              OR (last_used_at + (SELECT COALESCE(default_ttl_days, 999999) FROM vsql_vault.retention_policies rp WHERE rp.purpose = vault_entries.purpose) * INTERVAL '1 day' < NOW()
+                  AND EXISTS (SELECT 1 FROM vsql_vault.retention_policies rp2 WHERE rp2.purpose = vault_entries.purpose AND rp2.default_ttl_days IS NOT NULL))
+              OR (created_at + (SELECT COALESCE(max_retention_days, 999999) FROM vsql_vault.retention_policies rp WHERE rp.purpose = vault_entries.purpose) * INTERVAL '1 day' < NOW())
+            )
+        "#;
+
+        if !auto_delete {
+            // Dry-run mode: find candidates, log them, but do NOT delete
+            let candidates: Vec<(Uuid, String, chrono::DateTime<Utc>, Option<chrono::DateTime<Utc>>, chrono::DateTime<Utc>)> = sqlx::query_as(
+                &format!(
+                    "SELECT id, purpose, created_at, expires_at, last_used_at FROM vsql_vault.vault_entries WHERE {purge_where}"
+                ),
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| VaultError::Storage(e.to_string()))?;
+
+            let count = candidates.len() as u64;
+            let mut sweep_candidates = Vec::new();
+
+            for (id, purpose, created_at, expires_at, last_used_at) in &candidates {
+                let reason = if expires_at.map_or(false, |e| e <= Utc::now()) {
+                    "ttl-expired".to_string()
+                } else {
+                    "inactivity-or-hard-ceiling".to_string()
+                };
+
+                // Log dry-run to purge_log
+                sqlx::query(
+                    r#"
+                    INSERT INTO vsql_vault.purge_log
+                        (entry_id, purpose, external_id, purge_method, purge_reason, purged_at, purged_by, proof_hash)
+                    VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7)
+                    "#,
+                )
+                .bind(id)
+                .bind(purpose)
+                .bind(id.to_string())
+                .bind("dry-run")
+                .bind(&reason)
+                .bind("system/purge-scheduler")
+                .bind::<Option<String>>(None)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| VaultError::Storage(format!("failed to record dry-run proof: {e}")))?;
+
+                sweep_candidates.push(PurgeSweepCandidate {
+                    id: *id,
+                    purpose: purpose.clone(),
+                    reason,
+                    last_used_at: Some(*last_used_at),
+                    created_at: *created_at,
+                    expires_at: *expires_at,
+                });
+            }
+
+            return Ok(PurgeSweepResult {
+                deleted: 0,
+                dry_run_candidates: count,
+                candidates: sweep_candidates,
+            });
+        }
+
+        // Auto-delete mode: physically delete + proof
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| VaultError::Storage(e.to_string()))?;
 
-        // Delete expired entries and return them for proof generation
         let deleted_rows = sqlx::query_as::<_, EntryRow>(
-            r#"
-            DELETE FROM vsql_vault.vault_entries
-            WHERE expires_at IS NOT NULL AND expires_at <= NOW()
-            RETURNING id, purpose, encrypted_blob, owner_app, encryption_svc, content_type,
-                      tags, created_at, updated_at, expires_at, access_policy
-            "#,
+            &format!(
+                "DELETE FROM vsql_vault.vault_entries WHERE {purge_where} RETURNING id, purpose, encrypted_blob, owner_app, encryption_svc, content_type, tags, created_at, updated_at, expires_at, last_used_at, access_policy"
+            ),
         )
         .fetch_all(&mut *tx)
         .await
         .map_err(|e| VaultError::Storage(e.to_string()))?;
 
         let count = deleted_rows.len() as u64;
+        let mut sweep_candidates = Vec::new();
 
-        // Record purge proof for each deleted entry
         for row in deleted_rows {
             let entry = VaultEntry::from(row);
             let proof_hash = vsql_vault_core::purge::compute_proof_hash(&entry);
@@ -176,13 +325,26 @@ impl VaultStorage for PgStorage {
             .execute(&mut *tx)
             .await
             .map_err(|e| VaultError::Storage(format!("failed to record purge proof: {e}")))?;
+
+            sweep_candidates.push(PurgeSweepCandidate {
+                id: entry.id,
+                purpose: entry.purpose.clone(),
+                reason: "ttl-expired".to_string(),
+                last_used_at: Some(entry.last_used_at),
+                created_at: entry.created_at,
+                expires_at: entry.expires_at,
+            });
         }
 
         tx.commit()
             .await
             .map_err(|e| VaultError::Storage(e.to_string()))?;
 
-        Ok(count)
+        Ok(PurgeSweepResult {
+            deleted: count,
+            dry_run_candidates: 0,
+            candidates: sweep_candidates,
+        })
     }
 
     async fn health_check(&self) -> Result<(), VaultError> {
@@ -442,6 +604,7 @@ struct EntryRow {
     created_at: chrono::DateTime<Utc>,
     updated_at: chrono::DateTime<Utc>,
     expires_at: Option<chrono::DateTime<Utc>>,
+    last_used_at: chrono::DateTime<Utc>,
     access_policy: String,
 }
 
@@ -461,6 +624,7 @@ impl From<EntryRow> for VaultEntry {
             created_at: row.created_at,
             updated_at: row.updated_at,
             expires_at: row.expires_at,
+            last_used_at: row.last_used_at,
             access_policy: row.access_policy,
         }
     }
@@ -476,6 +640,7 @@ struct SummaryRow {
     tags: serde_json::Value,
     created_at: chrono::DateTime<Utc>,
     expires_at: Option<chrono::DateTime<Utc>>,
+    last_used_at: chrono::DateTime<Utc>,
 }
 
 impl From<SummaryRow> for VaultEntrySummary {
@@ -492,6 +657,7 @@ impl From<SummaryRow> for VaultEntrySummary {
             },
             created_at: row.created_at,
             expires_at: row.expires_at,
+            last_used_at: row.last_used_at,
         }
     }
 }

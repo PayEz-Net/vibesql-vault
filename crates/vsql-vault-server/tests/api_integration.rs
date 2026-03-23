@@ -683,13 +683,14 @@ async fn test_purge_expired_generates_proof() {
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         expires_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+        last_used_at: chrono::Utc::now(),
         access_policy: "owner-only".into(),
     };
     state.storage.store(&entry).await.unwrap();
 
     // Run purge
-    let purged = state.storage.purge_expired().await.unwrap();
-    assert_eq!(purged, 1);
+    let result = state.storage.purge_expired(true).await.unwrap();
+    assert_eq!(result.deleted, 1);
 
     // Check purge log has proof hash
     let logs = state

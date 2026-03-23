@@ -47,6 +47,24 @@ impl PurgeMethod {
     }
 }
 
+/// Result of a purge sweep operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PurgeSweepResult {
+    pub deleted: u64,
+    pub dry_run_candidates: u64,
+    pub candidates: Vec<PurgeSweepCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PurgeSweepCandidate {
+    pub id: Uuid,
+    pub purpose: String,
+    pub reason: String,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
 /// Compute SHA-256 proof hash of an entry at time of purge.
 ///
 /// The hash covers: id, purpose, encrypted_blob (hex), owner_app, created_at.
@@ -88,6 +106,7 @@ mod tests {
                 .with_timezone(&Utc),
             updated_at: Utc::now(),
             expires_at: None,
+            last_used_at: Utc::now(),
             access_policy: "owner-only".into(),
         }
     }

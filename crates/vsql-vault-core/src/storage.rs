@@ -3,9 +3,9 @@ use uuid::Uuid;
 
 use crate::access_log::AccessLogEntry;
 use crate::access_policy::AccessPolicy;
-use crate::entry::{VaultEntry, VaultEntrySummary};
+use crate::entry::{TouchResult, VaultEntry, VaultEntrySummary};
 use crate::error::VaultError;
-use crate::purge::PurgeLogEntry;
+use crate::purge::{PurgeLogEntry, PurgeSweepResult};
 use crate::retention::RetentionPolicy;
 
 #[async_trait]
@@ -25,7 +25,15 @@ pub trait VaultStorage: Send + Sync {
         offset: u32,
     ) -> Result<(Vec<VaultEntrySummary>, u64), VaultError>;
 
-    async fn purge_expired(&self) -> Result<u64, VaultError>;
+    async fn touch(
+        &self,
+        purpose: &str,
+        id: &Uuid,
+        extend_ttl: bool,
+        key_ref: Option<&str>,
+    ) -> Result<Option<TouchResult>, VaultError>;
+
+    async fn purge_expired(&self, auto_delete: bool) -> Result<PurgeSweepResult, VaultError>;
 
     async fn health_check(&self) -> Result<(), VaultError>;
 

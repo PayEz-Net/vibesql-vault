@@ -54,6 +54,8 @@ pub struct PurgeConfig {
     pub enabled: bool,
     #[serde(default = "default_purge_interval")]
     pub interval_secs: u64,
+    #[serde(default)]
+    pub auto_delete: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -122,6 +124,7 @@ impl Default for PurgeConfig {
         Self {
             enabled: default_purge_enabled(),
             interval_secs: default_purge_interval(),
+            auto_delete: false,
         }
     }
 }

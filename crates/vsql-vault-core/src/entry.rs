@@ -14,12 +14,25 @@ pub struct VaultEntry {
     pub updated_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
+    pub last_used_at: DateTime<Utc>,
     #[serde(default = "default_access_policy")]
     pub access_policy: String,
 }
 
 fn default_access_policy() -> String {
     "owner-only".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TouchResult {
+    pub id: Uuid,
+    pub purpose: String,
+    pub last_used_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_ref: Option<String>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +54,7 @@ pub struct VaultEntrySummary {
     pub created_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<DateTime<Utc>>,
+    pub last_used_at: DateTime<Utc>,
 }
 
 impl From<VaultEntry> for VaultEntrySummary {
@@ -51,6 +65,7 @@ impl From<VaultEntry> for VaultEntrySummary {
             metadata: e.metadata,
             created_at: e.created_at,
             expires_at: e.expires_at,
+            last_used_at: e.last_used_at,
         }
     }
 }
@@ -104,6 +119,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             expires_at: None,
+            last_used_at: Utc::now(),
             access_policy: "owner-only".into(),
         };
         assert!(!entry.is_expired());
@@ -124,6 +140,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             expires_at: Some(Utc::now() - chrono::Duration::hours(1)),
+            last_used_at: Utc::now(),
             access_policy: "owner-only".into(),
         };
         assert!(entry.is_expired());
@@ -144,6 +161,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             expires_at: Some(Utc::now() + chrono::Duration::hours(1)),
+            last_used_at: Utc::now(),
             access_policy: "owner-only".into(),
         };
         assert!(!entry.is_expired());
@@ -164,6 +182,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             expires_at: None,
+            last_used_at: Utc::now(),
             access_policy: "owner-only".into(),
         };
         let summary = VaultEntrySummary::from(entry.clone());
@@ -186,6 +205,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             expires_at: None,
+            last_used_at: Utc::now(),
             access_policy: "owner-only".into(),
         };
         let json = serde_json::to_string(&entry).unwrap();

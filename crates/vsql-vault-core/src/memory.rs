@@ -105,11 +105,37 @@ impl VaultStorage for MemoryStorage {
         Ok((page, total))
     }
 
-    async fn purge_expired(&self) -> Result<u64, VaultError> {
+    async fn touch(
+        &self,
+        purpose: &str,
+        id: &Uuid,
+        _extend_ttl: bool,
+        _key_ref: Option<&str>,
+    ) -> Result<Option<crate::entry::TouchResult>, VaultError> {
+        let key = EntryKey { purpose: purpose.to_string(), id: *id };
+        let mut entries = self.entries.write().await;
+        match entries.get_mut(&key) {
+            Some(entry) if !entry.is_expired() => {
+                let now = Utc::now();
+                entry.last_used_at = now;
+                entry.updated_at = now;
+                Ok(Some(crate::entry::TouchResult {
+                    id: *id,
+                    purpose: purpose.to_string(),
+                    last_used_at: now,
+                    expires_at: entry.expires_at,
+                    key_ref: None,
+                    updated_at: now,
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    async fn purge_expired(&self, auto_delete: bool) -> Result<crate::purge::PurgeSweepResult, VaultError> {
         let now = Utc::now();
         let mut entries = self.entries.write().await;
 
-        // Collect expired entries for proof generation before removal
         let expired: Vec<crate::entry::VaultEntry> = entries
             .values()
             .filter(|e| e.expires_at.is_some_and(|exp| now > exp))
@@ -118,28 +144,29 @@ impl VaultStorage for MemoryStorage {
 
         let count = expired.len() as u64;
 
-        // Generate proof hash and record purge log for each expired entry
-        if !expired.is_empty() {
-            let mut purge_log = self.purge_log.write().await;
-            for entry in &expired {
-                let proof_hash = crate::purge::compute_proof_hash(entry);
-                purge_log.push(PurgeLogEntry {
-                    id: None,
-                    entry_id: entry.id,
-                    purpose: entry.purpose.clone(),
-                    external_id: entry.id.to_string(),
-                    purge_method: crate::purge::PurgeMethod::RetentionExpire,
-                    purge_reason: "ttl-expired".into(),
-                    purged_at: now,
-                    purged_by: "system/purge-scheduler".into(),
-                    proof_hash: Some(proof_hash),
-                });
+        if auto_delete {
+            if !expired.is_empty() {
+                let mut purge_log = self.purge_log.write().await;
+                for entry in &expired {
+                    let proof_hash = crate::purge::compute_proof_hash(entry);
+                    purge_log.push(PurgeLogEntry {
+                        id: None,
+                        entry_id: entry.id,
+                        purpose: entry.purpose.clone(),
+                        external_id: entry.id.to_string(),
+                        purge_method: crate::purge::PurgeMethod::RetentionExpire,
+                        purge_reason: "ttl-expired".into(),
+                        purged_at: now,
+                        purged_by: "system/purge-scheduler".into(),
+                        proof_hash: Some(proof_hash),
+                    });
+                }
             }
+            entries.retain(|_, e| e.expires_at.is_none_or(|exp| now <= exp));
+            Ok(crate::purge::PurgeSweepResult { deleted: count, dry_run_candidates: 0, candidates: vec![] })
+        } else {
+            Ok(crate::purge::PurgeSweepResult { deleted: 0, dry_run_candidates: count, candidates: vec![] })
         }
-
-        // Remove expired entries
-        entries.retain(|_, e| e.expires_at.is_none_or(|exp| now <= exp));
-        Ok(count)
     }
 
     async fn health_check(&self) -> Result<(), VaultError> {
@@ -240,6 +267,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             expires_at,
+            last_used_at: Utc::now(),
             access_policy: "owner-only".into(),
         }
     }
@@ -331,8 +359,8 @@ mod tests {
             ))
             .await
             .unwrap();
-        let purged = store.purge_expired().await.unwrap();
-        assert_eq!(purged, 2);
+        let result = store.purge_expired(true).await.unwrap();
+        assert_eq!(result.deleted, 2);
     }
 
     #[tokio::test]

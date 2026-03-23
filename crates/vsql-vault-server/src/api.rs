@@ -250,6 +250,7 @@ pub async fn store_entry(
         created_at: now,
         updated_at: now,
         expires_at: effective_expires_at,
+        last_used_at: now, // creation = first use
         access_policy: policy_name.clone(),
     };
 
@@ -604,4 +605,93 @@ async fn audit_log(
         )
             .into_response()
     })
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  Phase 2A: Touch/Renew + Admin Sweep
+// ══════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Deserialize)]
+pub struct TouchRequest {
+    #[serde(default)]
+    pub extend_ttl: bool,
+    pub key_ref: Option<String>,
+}
+
+/// PATCH /v1/vault/{purpose}/{entry_id} — Touch/renew an entry.
+/// Stamps last_used_at. Optionally extends TTL and/or updates key_ref.
+/// Empty body is a valid touch (stamps last_used_at only).
+pub async fn touch_entry(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthContext>,
+    Path((purpose, entry_id)): Path<(String, String)>,
+    body: Option<Json<TouchRequest>>,
+) -> impl IntoResponse {
+    let id = match Uuid::parse_str(&entry_id) {
+        Ok(id) => id,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid UUID"}))).into_response(),
+    };
+
+    let req = body.map(|b| b.0).unwrap_or(TouchRequest { extend_ttl: false, key_ref: None });
+
+    match state.storage.touch(&purpose, &id, req.extend_ttl, req.key_ref.as_deref()).await {
+        Ok(Some(result)) => {
+            tracing::info!(
+                purpose = %purpose, id = %id, extend_ttl = req.extend_ttl,
+                caller = %auth.caller_id, "touch/renew entry"
+            );
+            (StatusCode::OK, Json(serde_json::json!({
+                "id": result.id,
+                "purpose": result.purpose,
+                "last_used_at": result.last_used_at,
+                "expires_at": result.expires_at,
+                "key_ref": result.key_ref,
+                "updated_at": result.updated_at,
+            }))).into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "entry not found or purged"}))).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "touch failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response()
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SweepQuery {
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// POST /admin/sweep?dry_run=true — Manual purge sweep trigger.
+/// Auth: vault-admin caller only.
+pub async fn admin_sweep(
+    State(state): State<Arc<AppState>>,
+    Extension(auth): Extension<AuthContext>,
+    Query(query): Query<SweepQuery>,
+) -> impl IntoResponse {
+    if auth.caller_id != "vault-admin" {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({
+            "error": "admin sweep requires X-Vault-Caller: vault-admin"
+        }))).into_response();
+    }
+
+    let auto_delete = !query.dry_run;
+    match state.storage.purge_expired(auto_delete).await {
+        Ok(result) => {
+            tracing::info!(
+                deleted = result.deleted, dry_run = result.dry_run_candidates,
+                caller = %auth.caller_id, "admin sweep executed"
+            );
+            (StatusCode::OK, Json(serde_json::json!({
+                "deleted": result.deleted,
+                "dry_run_candidates": result.dry_run_candidates,
+                "candidates": result.candidates,
+            }))).into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "admin sweep failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))).into_response()
+        }
+    }
 }
