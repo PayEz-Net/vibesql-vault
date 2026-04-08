@@ -1,0 +1,47 @@
+DotNetPert,
+
+QSAPert audited vsql-vault and found 4 code-level compliance blockers. All are in the Rust codebase at E:\Repos\vsql-vault. 56 tests passing, clippy clean, fmt clean — your starting point is solid.
+
+## Finding 1 (High) — Audit logging must be blocking
+
+File: crates/vsql-vault-server/src/api.rs
+Function: log_and_forget()
+
+Currently fire-and-forget — if the audit log write fails, the operation proceeds without an audit record. PCI requires provable logging of every access. Fix: if the audit write fails, fail the operation. No log = no access. Rename or replace log_and_forget with a blocking audit function that returns an error response on failure.
+
+## Finding 2 (High) — Caller identity hardcoded
+
+File: crates/vsql-vault-server/src/api.rs
+Lines: retrieve_entry, delete_entry, head_entry, list_entries all hardcode `let caller_app = "authenticated-caller";`
+
+The audit trail is useless for proving who accessed what. The auth middleware (middleware.rs) validates the API key but doesn't extract or pass caller identity. Fix: extract real identity from the auth context. Could be the API key name, a header like X-Vault-Caller, or JWT sub claim. Pass it through the middleware into the handlers. store_entry already gets caller from body.metadata.owner_app — the other handlers need something equivalent.
+
+## Finding 3 (High) — Access policy not enforced on retrieve
+
+File: crates/vsql-vault-server/src/api.rs
+Line 242: `let policy_name = "owner-only"; // TODO: store access_policy on entry and check here`
+
+The access_policy field is stored on vault entries (it's in StoreRequest and StoreResponse), but on retrieve it's ignored — always evaluates owner-only. Fix: read the access_policy from the stored entry and evaluate against it. The access_policy infrastructure exists (access_policies table, get_access_policy, can_retrieve evaluation) — it just needs to be wired up. Note: VaultEntry may need an access_policy field added to the struct.
+
+## Finding 4 (Medium) — Purge sweep skips proof generation
+
+File: crates/vsql-vault-core/src/memory.rs — purge_expired()
+File: crates/vsql-vault-server/src/pg_storage.rs — purge_expired()
+
+Manual deletes via the API compute SHA-256 proof hash and write to purge_log. But purge_expired() (the scheduled sweep) bulk-deletes without proof. Fix: before deleting expired entries, retrieve them, compute proof hash for each, write purge_log entries with purge_reason "retention-expire", then delete. Both MemoryStorage and PgStorage need the fix.
+
+## Code Location
+
+E:\Repos\vsql-vault\
+- Core crate: crates/vsql-vault-core/src/
+- Server crate: crates/vsql-vault-server/src/
+- Integration tests: crates/vsql-vault-server/tests/api_integration.rs
+- Migrations: migrations/
+
+Run tests: SQLX_OFFLINE=true cargo test --workspace
+Clippy: SQLX_OFFLINE=true cargo clippy --workspace -- -D warnings
+Format: cargo fmt --check
+
+Add tests for the fixes — especially blocking audit failure and purge sweep proof generation.
+
+- BAPert

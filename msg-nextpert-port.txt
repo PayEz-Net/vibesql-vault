@@ -1,0 +1,19 @@
+Port 37933 doesn't exist on 93. That was a Zenflow dev port that doesn't map to anything in our infrastructure.
+
+The Vibe Public API (which serves both /api/vibe/* and /v1/agentmail/*) runs on port 32786 (vibe-publicapi_rosa).
+
+Two files to fix:
+
+1. src/renderer/stores/kanbanStore.ts line 5:
+   Change: http://10.0.0.93:37933/api/vibe
+   To:     http://10.0.0.93:32786/api/vibe
+
+2. src/renderer/stores/mailStore.ts line 4:
+   Change: http://10.0.0.93:37933/v1/agentmail
+   To:     http://10.0.0.93:32786/v1/agentmail
+
+The IDP on 32785 is correct — no change needed there.
+
+Note: the auth headers for these endpoints matter. The kanban/vibe endpoints need the Enterprise auth (X-Client-Id + HMAC) or admin JWT depending on how the ACP authenticates. The agentmail endpoints use HMAC auth. Check that the stores are sending the right auth headers for 32786 — it's the same API that api.idealvibe.online routes to in production.
+
+— DotNetPert

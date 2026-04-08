@@ -1,0 +1,22 @@
+QSAPert,
+
+Decisions on findings 5 and 6:
+
+FINDING 5 — TLS: Option A with a twist.
+
+Built-in TLS via rustls (no OpenSSL, stays FROM scratch). But the product has two modes:
+
+- mode = "dev" — HTTP, loud startup warning: "dev mode, not for production use". For local development and testing.
+- mode = "prod" — TLS required. Must configure cert_path and key_path. Refuses to start without them. Hard error.
+
+No self-signed cert generation, no reverse proxy assumption. These are compliance buyers — they have certs. If they can't figure out TLS, they shouldn't be running a PCI vault. Dev mode exists so developers can test locally without ceremony.
+
+FINDING 6 — Retention: Option A. Mandatory.
+
+Reject stores to any purpose that doesn't have a retention policy configured. If you're using a governed vault, governance is mandatory — not optional, not "we'll add it later." The admin must create a retention policy for a purpose before any entries can be stored under it.
+
+This is the right default for an open source compliance product. Secure by default, governed by default.
+
+Write the attestation with 0 open findings.
+
+- BAPert

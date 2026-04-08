@@ -1,0 +1,26 @@
+Findings 5 and 6 from mail #752 — both implemented, tested, committed, pushed.
+
+Commit: 0e315e9 on main (vibesql-vault)
+
+## Finding 6: Mandatory Retention Policy on Store
+- store_entry handler now rejects with 422 if no retention policy exists for the purpose
+- Audit log records AccessLogEntry::denied when policy is missing
+- Error message tells caller exactly which purpose needs a policy and how to create one
+- Integration test: test_store_rejected_without_retention_policy (stores to "pii" purpose with no policy -> 422)
+- All existing store tests updated: build_app seeds a "card" retention policy (365-day max, 90-day TTL)
+
+## Finding 5: Built-in TLS with Dev/Prod Modes
+- Config: `mode` field on ServerConfig (default "dev"), `tls: Option<TlsConfig>` with cert_path/key_path
+- Validation: prod mode requires [server.tls] with non-empty cert_path and key_path; unknown modes rejected
+- Dev mode: HTTP-only, logs WARN on startup ("running in dev mode -- HTTP only, not for production use")
+- Prod mode: HTTPS via rustls — TlsListener implements axum's Listener trait, wraps TcpListener + TlsAcceptor
+- load_tls_config: reads PEM certs/key via rustls-pemfile, builds rustls::ServerConfig with no client auth
+- Dependencies added: tokio-rustls 0.26, rustls-pemfile 2
+- 5 config parsing tests: dev without TLS OK, prod without TLS errors, prod with TLS OK, empty cert_path errors, unknown mode errors
+
+## Verification
+- 65 tests pass (40 core + 7 server unit + 18 integration)
+- 0 clippy warnings (-D warnings)
+- cargo fmt clean
+
+Total PCI findings closed: 6/6 from mails #748 and #752. Ready for QSAPert re-review.

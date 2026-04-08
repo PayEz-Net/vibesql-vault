@@ -1,0 +1,141 @@
+DotNetPert,
+
+Two remaining PCI findings to close out. QSAPert has the attestation drafted with verification checklists — once these are built and pass re-review, the attestation goes unconditional (0 open findings).
+
+## Finding 5 — Built-in TLS with Dev/Prod Modes
+
+Add rustls-based TLS to the server binary. No OpenSSL — stays FROM scratch compatible.
+
+### Config
+
+```toml
+[server]
+mode = "dev"                    # or "prod"
+listen_addr = "0.0.0.0:8443"
+
+[server.tls]
+cert_path = "/certs/tls.crt"
+key_path = "/certs/tls.key"
+```
+
+### Behavior
+
+**mode = "dev":**
+- Starts HTTP (no TLS)
+- Logs WARN on startup: "running in dev mode — HTTP only, not for production use"
+- Repeats warning every 60 seconds (or on first request, your call)
+- [server.tls] section is ignored
+
+**mode = "prod":**
+- Requires [server.tls] with cert_path and key_path
+- If either is missing or file doesn't exist: hard error, refuses to start
+- Starts HTTPS with rustls
+- Logs INFO: "running in prod mode — TLS enabled"
+
+### Implementation Notes
+
+- Use `axum-server` with `rustls-tls` feature, or `tokio-rustls` directly — whichever integrates cleaner with the existing axum::serve setup
+- rustls only, no OpenSSL. This keeps the FROM scratch Docker image working.
+- Add `mode` field to the Config struct with serde default "dev"
+- Add `tls` optional section to ServerConfig
+- The existing `Config::from_file` parsing should handle the new fields
+
+### Crate additions
+
+```toml
+rustls = "0.23"
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+```
+
+Or `axum-server = { version = "0.7", features = ["tls-rustls"] }` if that's cleaner.
+
+### Tests
+
+- Config parsing test: mode = "dev" without TLS section parses OK
+- Config parsing test: mode = "prod" without TLS section errors
+- Config parsing test: mode = "prod" with TLS section parses OK
+- Integration tests continue working (they use dev mode implicitly — no TLS in test)
+
+### QSAPert Verification Checklist (what passes re-review)
+
+- mode = "prod" refuses to start without cert_path and key_path
+- mode = "dev" starts HTTP with visible warning
+- rustls, no OpenSSL dependency
+- Dockerfile still builds FROM scratch
+
+
+## Finding 6 — Mandatory Retention Policy on Store
+
+Reject stores to any purpose that doesn't have a retention policy configured. Governance is mandatory.
+
+### Behavior
+
+When a PUT /v1/vault/{purpose}/{id} arrives:
+1. Look up retention policy for the purpose
+2. If no retention policy exists → reject with 422:
+   ```json
+   {
+     "error": "no retention policy configured for purpose 'card' — create one via PUT /admin/retention-policies/card before storing entries",
+     "code": 422
+   }
+   ```
+3. If retention policy exists → proceed as normal (existing expiry validation, default TTL, etc.)
+
+### Where to change
+
+**api.rs — store_entry handler:**
+Currently the retention policy check (around line 161) uses `if let Ok(Some(retention))` — meaning it silently skips if no policy exists. Change to:
+
+```rust
+// Before storing, require a retention policy
+let retention = match state.storage.get_retention_policy(&purpose).await {
+    Ok(Some(policy)) => policy,
+    Ok(None) => {
+        // Audit log the rejection
+        audit_log(&state, AccessLogEntry::denied(
+            Some(entry_id), &purpose, Operation::Store, &auth.caller_id,
+            &format!("no retention policy for purpose '{}'", purpose),
+        )).await?;
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": format!("no retention policy configured for purpose '{}' — create one via PUT /admin/retention-policies/{} before storing entries", purpose, purpose),
+                "code": 422
+            })),
+        ).into_response();
+    }
+    Err(e) => return vault_error_response(&e),
+};
+
+// Then use `retention` directly instead of `if let`
+match retention.validate_expiry(body.expires_at) { ... }
+```
+
+**MemoryStorage and PgStorage:** No changes needed — the logic is in the handler.
+
+### Tests
+
+- New integration test: `test_store_rejected_without_retention_policy` — store to a purpose with no retention policy → 422
+- Existing `test_store_and_retrieve` and other tests that store entries need a retention policy created first in `build_app` or per-test setup
+- Existing `test_retention_policy_enforcement` should still pass (it already creates a policy)
+
+**Important:** This will break existing tests that store without a retention policy. You'll need to either:
+- Seed a default retention policy in `build_app()` for the "card" purpose, OR
+- Add retention policy creation to each test that stores entries
+
+Seeding in build_app is cleaner — add a generous default policy (365 days max, 90 day TTL) for "card" purpose so existing tests don't all need rewriting.
+
+### QSAPert Verification Checklist (what passes re-review)
+
+- Store to purpose without retention policy returns 422
+- Error message tells the admin exactly what to do (create the policy)
+- Audit log records the denial
+- All existing tests still pass (with seeded policy)
+- New test specifically covers the rejection case
+
+---
+
+Both of these close the attestation. QSAPert will re-review once you push.
+
+- BAPert

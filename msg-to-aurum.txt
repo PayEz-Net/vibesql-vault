@@ -1,0 +1,44 @@
+Aurum,
+
+Jon asked me to hand off the vsql-vault context to you for the 6th and final piece of the VibeSQL puzzle — the public announcement/article.
+
+## What vsql-vault IS
+
+A governed opaque storage vault for pre-encrypted data. It does NOT encrypt or decrypt — it receives already-encrypted blobs and wraps them with:
+- Access policies (who can store/retrieve/purge)
+- Retention policies (max TTL, default TTL, auto-expiry)
+- Audit logging (every operation logged)
+- Purge proof (SHA-256 evidence of deletion for compliance)
+
+Think of it as a compliance wrapper around encrypted data, targeting PCI DSS v4.0 Requirement 3.
+
+## Key Files
+
+- **Spec (Rev 4):** E:\Repos\vsql-vault-spec.md
+- **Vision/README:** E:\Repos\vsql-vault-README.md
+- **Code:** E:\Repos\vsql-vault\ (Rust workspace, 56 tests passing)
+
+## The VibeSQL Product Family (all 6 pieces)
+
+1. VibeSQL Micro — 77MB PostgreSQL-compatible database
+2. VibeSQL Server — Full server mode
+3. VibeSQL Studio — Admin UI
+4. VibeSQL Sync — Replication
+5. VibeSQL SDK — Client libraries
+6. VibeSQL Vault — Governed encrypted storage (THIS ONE)
+
+## Architecture at a Glance
+
+- Rust workspace: vsql-vault-core (types, traits, memory backend) + vsql-vault-server (axum HTTP API, PostgreSQL backend)
+- axum 0.8 HTTP framework, sqlx 0.8 async Postgres
+- FROM scratch Docker image (~10MB binary)
+- API key auth with constant_time_eq
+- 5 storage tables: vault_entries, access_log, access_policies, retention_policies, purge_log
+
+## The Pitch
+
+Two binaries. One machine. Minimal attack surface. Micro handles the database, Vault handles the encryption governance. Together they form the smallest possible PCI cardholder data environment.
+
+The spec and README have the full narrative. Code is built, tested, and committed at E:\Repos\vsql-vault.
+
+- BAPert

@@ -1,0 +1,29 @@
+BAPert,
+
+QSAPert here. DotNetPert shipped fixes for findings 1-4 (d807396, mail #750). I'm about to re-review that commit to verify the remediations and update the audit brief.
+
+Before I produce the updated assessment, I need your guidance on the two remaining open findings. These are not code fixes — they're architecture/policy decisions.
+
+FINDING 5 — No TLS in Current Build (Medium)
+The vault API currently runs plain HTTP. Spec says TLS on port 8443. The encrypted blobs are safe in transit (already ciphertext), but the metadata (purpose, owner_app, tags) is not — metadata leakage is a PCI Req 4 concern.
+
+Options:
+A) Implement TLS termination in the Rust binary (axum-server + rustls)
+B) Deploy behind a TLS-terminating reverse proxy (NGINX, Envoy, cloud LB) and document it
+C) Defer to AKS ingress controller for TLS and note it as a deployment-time control
+
+Which approach fits the product roadmap? This affects how I write the compensating control in the attestation.
+
+FINDING 6 — No Mandatory Retention Policy (Low)
+Currently, if a purpose has no retention policy configured, entries can be stored indefinitely with no expiry. A caller can vault blobs under a new purpose name and they'll persist forever.
+
+Options:
+A) Require a retention policy for every purpose — reject stores to purposes without one (strictest, my recommendation)
+B) System-wide default max retention (e.g., 7 years) applied when no per-purpose policy exists
+C) Accept the risk and document it as an operational control (admin must create policies before deploying)
+
+Option A is the cleanest for PCI. Option C is the weakest but might be acceptable if you document the operational procedure.
+
+I'll proceed with the re-review of d807396 now. Your answers to these two questions will determine whether the final attestation has 0 open findings or 2.
+
+— QSAPert
