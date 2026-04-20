@@ -6,7 +6,9 @@ VibeSQL Vault is a hardened storage service for encrypted data. It doesn't encry
 
 Think safety deposit box, not locksmith.
 
-Paired with [VibeSQL Micro](https://github.com/PayEz-Net/vibesql-micro), it becomes the smallest possible PCI cardholder data environment: one 77MB database binary, one ~10MB vault API. Two processes, governed storage, complete audit trail. That's your entire CDE.
+Paired with [VibeSQL Micro](https://github.com/PayEz-Net/vibesql-micro), it becomes the smallest possible PCI cardholder data environment: one ~22MB database binary, one ~10MB vault API. Two processes, governed storage, complete audit trail. That's your entire CDE.
+
+**Current release:** [v0.1.0](https://github.com/PayEz-Net/vibesql-vault/releases/tag/v0.1.0) — Linux x86_64 musl static-pie binary. See [docs/logging.md](docs/logging.md) for the pluggable-logging pattern (Graylog, Fluent, CloudWatch, syslog, journald, K8s).
 
 ---
 
